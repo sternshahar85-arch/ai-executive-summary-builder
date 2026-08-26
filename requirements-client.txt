@@ -1,0 +1,7 @@
+# Dependencies for scribe.py (the recording client, packaged via build.bat into dist/scribe.exe)
+# Pinned to versions verified installed on the build machine, 2026-08-26.
+numpy==2.5.2
+scipy==1.18.0
+google-cloud-storage==3.13.1
+google-auth==2.56.3
+PyAudioWPatch==0.2.12.8
