@@ -7,6 +7,21 @@ from google import genai
 from google.genai import types
 from google.cloud import storage
 from google.api_core.exceptions import PreconditionFailed
+from rapidfuzz import fuzz
+
+GROUNDING_THRESHOLD = 80
+
+
+def is_grounded(source_quote, transcript, threshold=GROUNDING_THRESHOLD):
+    """
+    Returns True if source_quote is missing (nothing to check) or fuzzy-matches
+    somewhere in transcript above threshold. Returns False only when a quote was
+    given but doesn't actually appear in the transcript -- i.e. likely hallucinated.
+    Deterministic, local, no extra Gemini call.
+    """
+    if not source_quote:
+        return True
+    return fuzz.partial_ratio(source_quote, transcript) >= threshold
 
 @functions_framework.cloud_event
 def tamlelan_handler(cloud_event):
@@ -80,6 +95,10 @@ def tamlelan_handler(cloud_event):
         Do not assert a relationship or connection between two topics unless it was
         explicitly stated in the meeting. Two topics mentioned in the same meeting are
         not automatically related.
+
+        For every decision and every action item, also include source_quote: a short
+        VERBATIM excerpt (a few words to one sentence) copied directly from the audio
+        that supports it, in the original spoken language. Do not paraphrase the quote.
         """
 
         # Notice: full_transcript is REMOVED from the schema to save tokens
@@ -107,7 +126,8 @@ def tamlelan_handler(cloud_event):
                         "properties": {
                             "statement": {"type": "STRING"},
                             "status": {"type": "STRING", "enum": ["decided", "proposed", "open"]},
-                            "hedge_note": {"type": "STRING", "nullable": True}
+                            "hedge_note": {"type": "STRING", "nullable": True},
+                            "source_quote": {"type": "STRING", "nullable": True}
                         },
                         "required": ["statement", "status"]
                     }
@@ -119,7 +139,8 @@ def tamlelan_handler(cloud_event):
                         "properties": {
                             "task": {"type": "STRING"},
                             "owner": {"type": "STRING", "nullable": True},
-                            "deadline": {"type": "STRING", "nullable": True}
+                            "deadline": {"type": "STRING", "nullable": True},
+                            "source_quote": {"type": "STRING", "nullable": True}
                         },
                         "required": ["task"]
                     }
@@ -172,6 +193,20 @@ def tamlelan_handler(cloud_event):
         print(f"[Step 4b] Transcript generation complete.")
 
         # ==========================================
+        # PASS 3 (LOCAL, NO API CALL): GROUNDING VERIFICATION
+        # ==========================================
+        # Fuzzy-match each source_quote against the transcript Pass 2 already
+        # produced. Flags likely-hallucinated claims rather than dropping them --
+        # a false-negative fuzzy match must not silently delete a true claim.
+        for d in (res_data.get('decisions_log') or []):
+            if isinstance(d, dict):
+                d['_grounded'] = is_grounded(d.get('source_quote'), full_transcript_text)
+        for item in (res_data.get('action_items') or []):
+            if isinstance(item, dict):
+                item['_grounded'] = is_grounded(item.get('source_quote'), full_transcript_text)
+        print("[Step 4c] Grounding verification complete.")
+
+        # ==========================================
         # BUILD MARKDOWN FILES
         # ==========================================
         executive_summary = res_data.get('executive_summary') or "לא זוהה מידע בולט בהקלטה."
@@ -212,7 +247,8 @@ def tamlelan_handler(cloud_event):
                     status = STATUS_LABELS.get(d.get('status'), d.get('status') or '-')
                     hedge = d.get('hedge_note')
                     hedge_suffix = f" _({hedge})_" if hedge else ""
-                    md_summary += f"* **[{status}]** {statement}{hedge_suffix}\n"
+                    warn_prefix = "⚠ " if not d.get('_grounded', True) else ""
+                    md_summary += f"* {warn_prefix}**[{status}]** {statement}{hedge_suffix}\n"
                 else:
                     md_summary += f"* {d}\n"
 
@@ -222,7 +258,8 @@ def tamlelan_handler(cloud_event):
         else:
             for item in action_items:
                 if isinstance(item, dict):
-                    md_summary += f"| {item.get('task') or '-'} | {item.get('owner') or '-'} | {item.get('deadline') or '-'} |\n"
+                    warn_prefix = "⚠ " if not item.get('_grounded', True) else ""
+                    md_summary += f"| {warn_prefix}{item.get('task') or '-'} | {item.get('owner') or '-'} | {item.get('deadline') or '-'} |\n"
                 else:
                     md_summary += f"| {item} | - | - |\n"
         md_summary += "\n</div>"
