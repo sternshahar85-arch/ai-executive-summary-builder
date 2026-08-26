@@ -55,21 +55,78 @@ def tamlelan_handler(cloud_event):
         print("[Step 3a] Running AI Analysis (Pass 1: Structured Summary)...")
         summary_prompt = """
         Analyze this meeting audio. All output text MUST be in fluent Hebrew.
+
         1. Provide an executive summary, key topics, decisions, and action items.
-        2. Evaluate if technical architectures or system designs were discussed.
+        2. Evaluate if technical architectures or system designs were discussed (diagram_needed).
+
+        Attendees: list every person mentioned by name. If their role or organization is
+        stated (e.g. in an introduction), include it. If not stated, leave it null -- do
+        not guess.
+
+        Decisions: for each decision-like statement, classify its status:
+        - "decided": the group reached a final, settled conclusion.
+        - "proposed": one option was suggested but not finally confirmed, or multiple
+          options were still being weighed.
+        - "open": the topic was raised but no resolution was reached at all.
+        Never upgrade a hedge ("we're leaning toward X", "I'd like this to eventually be
+        Y", "maybe we do Z") into "decided" -- if the speaker expressed a hope, intention,
+        or one option among several, mark it "proposed" or "open" and record the hedge
+        language itself in hedge_note.
+
+        Action items: extract the owner and deadline ONLY if explicitly stated in the
+        audio. If either is not stated, return null for that field -- never guess or
+        infer a plausible owner or deadline.
+
+        Do not assert a relationship or connection between two topics unless it was
+        explicitly stated in the meeting. Two topics mentioned in the same meeting are
+        not automatically related.
         """
-        
+
         # Notice: full_transcript is REMOVED from the schema to save tokens
         schema = {
             "type": "OBJECT",
             "properties": {
                 "executive_summary": {"type": "STRING"},
+                "attendees": {
+                    "type": "ARRAY",
+                    "items": {
+                        "type": "OBJECT",
+                        "properties": {
+                            "name": {"type": "STRING"},
+                            "role": {"type": "STRING", "nullable": True},
+                            "organization": {"type": "STRING", "nullable": True}
+                        },
+                        "required": ["name"]
+                    }
+                },
                 "key_topics": {"type": "ARRAY", "items": {"type": "STRING"}},
-                "decisions_log": {"type": "ARRAY", "items": {"type": "STRING"}},
-                "action_items": {"type": "ARRAY", "items": {"type": "STRING"}},
+                "decisions_log": {
+                    "type": "ARRAY",
+                    "items": {
+                        "type": "OBJECT",
+                        "properties": {
+                            "statement": {"type": "STRING"},
+                            "status": {"type": "STRING", "enum": ["decided", "proposed", "open"]},
+                            "hedge_note": {"type": "STRING", "nullable": True}
+                        },
+                        "required": ["statement", "status"]
+                    }
+                },
+                "action_items": {
+                    "type": "ARRAY",
+                    "items": {
+                        "type": "OBJECT",
+                        "properties": {
+                            "task": {"type": "STRING"},
+                            "owner": {"type": "STRING", "nullable": True},
+                            "deadline": {"type": "STRING", "nullable": True}
+                        },
+                        "required": ["task"]
+                    }
+                },
                 "diagram_needed": {"type": "BOOLEAN"}
             },
-            "required": ["executive_summary", "key_topics", "decisions_log", "action_items", "diagram_needed"]
+            "required": ["executive_summary", "attendees", "key_topics", "decisions_log", "action_items", "diagram_needed"]
         }
         
         summary_response = client.models.generate_content(
@@ -118,30 +175,54 @@ def tamlelan_handler(cloud_event):
         # BUILD MARKDOWN FILES
         # ==========================================
         executive_summary = res_data.get('executive_summary') or "לא זוהה מידע בולט בהקלטה."
+        attendees = res_data.get('attendees') or []
         key_topics = res_data.get('key_topics') or []
         decisions = res_data.get('decisions_log') or []
         action_items = res_data.get('action_items') or []
 
+        STATUS_LABELS = {"decided": "הוחלט", "proposed": "הוצע", "open": "פתוח"}
+
         md_summary = f"<div dir='rtl'>\n# סיכום פגישה\n\n"
         md_summary += f"## תקציר מנהלים\n{executive_summary}\n\n"
-        
-        md_summary += "## נושאים מרכזיים\n"
+
+        md_summary += "## משתתפים\n"
+        if not attendees: md_summary += "* לא זוהו משתתפים\n"
+        else:
+            for a in attendees:
+                if isinstance(a, dict):
+                    name = a.get('name') or '-'
+                    role = a.get('role')
+                    org = a.get('organization')
+                    detail = " (" + ", ".join(x for x in (role, org) if x) + ")" if (role or org) else ""
+                    md_summary += f"* {name}{detail}\n"
+                else:
+                    md_summary += f"* {a}\n"
+
+        md_summary += "\n## נושאים מרכזיים\n"
         if not key_topics: md_summary += "* לא זוהו נושאים מרכזיים\n"
         else:
             for t in key_topics: md_summary += f"* {t}\n"
-        
+
         md_summary += "\n## החלטות שהתקבלו\n"
         if not decisions: md_summary += "* לא התקבלו החלטות\n"
         else:
-            for d in decisions: md_summary += f"* {d}\n"
-        
+            for d in decisions:
+                if isinstance(d, dict):
+                    statement = d.get('statement') or '-'
+                    status = STATUS_LABELS.get(d.get('status'), d.get('status') or '-')
+                    hedge = d.get('hedge_note')
+                    hedge_suffix = f" _({hedge})_" if hedge else ""
+                    md_summary += f"* **[{status}]** {statement}{hedge_suffix}\n"
+                else:
+                    md_summary += f"* {d}\n"
+
         md_summary += "\n## משימות לביצוע\n| משימה | אחראי | יעד |\n|---|---|---|\n"
         if not action_items:
             md_summary += "| לא זוהו משימות | - | - |\n"
         else:
             for item in action_items:
                 if isinstance(item, dict):
-                    md_summary += f"| {item.get('task','-')} | {item.get('owner','-')} | {item.get('deadline','-')} |\n"
+                    md_summary += f"| {item.get('task') or '-'} | {item.get('owner') or '-'} | {item.get('deadline') or '-'} |\n"
                 else:
                     md_summary += f"| {item} | - | - |\n"
         md_summary += "\n</div>"
