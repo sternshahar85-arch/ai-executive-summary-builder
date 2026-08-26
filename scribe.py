@@ -30,6 +30,38 @@ mic_frames = []
 sys_frames = []
 
 # ==========================================
+# AUDIO PROCESSING (module-level: unit-testable without recording hardware)
+# ==========================================
+def process_audio(frames, channels, original_rate):
+    """Joins raw int16 frame bytes into one channel, downmixing multi-channel
+    source devices to mono and resampling to TARGET_SAMPLE_RATE."""
+    if not frames:
+        return np.array([], dtype=np.int16)
+    raw_data = b''.join(frames)
+    arr = np.frombuffer(raw_data, dtype=np.int16)
+
+    if channels > 1:
+        arr = arr.reshape(-1, channels).mean(axis=1)
+
+    if original_rate != TARGET_SAMPLE_RATE:
+        gcd = math.gcd(TARGET_SAMPLE_RATE, original_rate)
+        up = TARGET_SAMPLE_RATE // gcd
+        down = original_rate // gcd
+        arr = resample_poly(arr, up, down)
+    return arr
+
+
+def build_output_audio(mic_array, sys_array, has_loopback):
+    """Rounds/clips/casts each channel to int16, then combines them into a
+    stereo track (left=mic, right=system) when a loopback device was present,
+    or mono (mic only) otherwise -- never a fake, silent right channel."""
+    mic_int16 = np.clip(np.round(mic_array), -32768, 32767).astype(np.int16)
+    sys_int16 = np.clip(np.round(sys_array), -32768, 32767).astype(np.int16)
+    if has_loopback:
+        return np.column_stack((mic_int16, sys_int16))
+    return mic_int16
+
+# ==========================================
 # PATH RESOLUTION & LOGGING
 # ==========================================
 def get_resource_path(relative_path):
@@ -227,22 +259,6 @@ def recording_thread_task(status_label, start_btn, end_btn):
         p.terminate()
 
         root_window.after(0, lambda: status_label.config(text="Status: Processing Dual Audio..."))
-        
-        def process_audio(frames, channels, original_rate):
-            if not frames:
-                return np.array([], dtype=np.int16)
-            raw_data = b''.join(frames)
-            arr = np.frombuffer(raw_data, dtype=np.int16)
-            
-            if channels > 1:
-                arr = arr.reshape(-1, channels).mean(axis=1)
-                
-            if original_rate != TARGET_SAMPLE_RATE:
-                gcd = math.gcd(TARGET_SAMPLE_RATE, original_rate)
-                up = TARGET_SAMPLE_RATE // gcd
-                down = original_rate // gcd
-                arr = resample_poly(arr, up, down)
-            return arr
 
         mic_array = process_audio(mic_frames, mic_channels, mic_rate)
         sys_array = process_audio(sys_frames, sys_channels, sys_rate)
@@ -255,19 +271,22 @@ def recording_thread_task(status_label, start_btn, end_btn):
         mic_array = np.pad(mic_array, (0, max_len - len(mic_array)))
         sys_array = np.pad(sys_array, (0, max_len - len(sys_array)))
 
-        # ARCHITECTURAL FIX: Rounding before casting prevents audio artifacts
-        mixed = np.round(mic_array).astype(np.int32) + np.round(sys_array).astype(np.int32)
-        mixed = np.clip(mixed, -32768, 32767).astype(np.int16)
+        # ARCHITECTURAL FIX (Phase 4): keep channels separate instead of summing them
+        # into one mono track. Left = operator's microphone, right = remote/system
+        # audio. This lets the analysis prompt tell the two apart, which a mono mix
+        # destroyed entirely. If no loopback device exists (nothing to distinguish
+        # from), write mono rather than a fake, silent right channel.
+        output_audio = build_output_audio(mic_array, sys_array, bool(default_loopback))
 
         # The Local Backup Vault
         backup_dir = os.path.join(get_executable_dir(), "Tamlelan_Backups")
         os.makedirs(backup_dir, exist_ok=True)
-        
+
         safe_filename = f"Meeting_Audio_{time.strftime('%Y%m%d_%H%M%S')}.wav"
         safe_file_path = os.path.join(backup_dir, safe_filename)
-        
+
         logging.info(f"Writing audio to safe backup vault: {safe_file_path}")
-        wavfile.write(safe_file_path, TARGET_SAMPLE_RATE, mixed)
+        wavfile.write(safe_file_path, TARGET_SAMPLE_RATE, output_audio)
         
         # Attempt Upload
         upload_to_gcp(safe_file_path)

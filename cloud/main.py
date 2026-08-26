@@ -71,6 +71,13 @@ def tamlelan_handler(cloud_event):
         summary_prompt = """
         Analyze this meeting audio. All output text MUST be in fluent Hebrew.
 
+        If the audio is stereo: the LEFT channel is the meeting operator (the person
+        running the recording), and the RIGHT channel is remote/system audio (other
+        participants on the call). Use this to help distinguish who is speaking --
+        the right channel may itself contain multiple remote speakers mixed together,
+        so treat it as "not the operator" rather than a single identified person unless
+        a name is stated. If the audio is mono, no such channel distinction exists.
+
         1. Provide an executive summary, key topics, decisions, and action items.
         2. Evaluate if technical architectures or system designs were discussed (diagram_needed).
 
