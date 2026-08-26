@@ -103,9 +103,17 @@ def tamlelan_handler(cloud_event):
         explicitly stated in the meeting. Two topics mentioned in the same meeting are
         not automatically related.
 
-        For every decision and every action item, also include source_quote: a short
-        VERBATIM excerpt (a few words to one sentence) copied directly from the audio
-        that supports it, in the original spoken language. Do not paraphrase the quote.
+        Each key topic has a topic_id (assign short stable ids: "t1", "t2", ...). Each
+        decision and action item has an optional related_topic_id field -- set it ONLY
+        if that specific decision/action item was explicitly discussed as part of that
+        topic. Leave it null by default. Being close together in time or sharing similar
+        wording is NOT enough to link them -- the connection must have been actually
+        stated. When in doubt, leave related_topic_id null.
+
+        For every key topic, decision, and action item, also include source_quote: a
+        short VERBATIM excerpt (a few words to one sentence) copied directly from the
+        audio that supports it, in the original spoken language. Do not paraphrase the
+        quote.
         """
 
         # Notice: full_transcript is REMOVED from the schema to save tokens
@@ -125,7 +133,18 @@ def tamlelan_handler(cloud_event):
                         "required": ["name"]
                     }
                 },
-                "key_topics": {"type": "ARRAY", "items": {"type": "STRING"}},
+                "key_topics": {
+                    "type": "ARRAY",
+                    "items": {
+                        "type": "OBJECT",
+                        "properties": {
+                            "topic_id": {"type": "STRING"},
+                            "title": {"type": "STRING"},
+                            "source_quote": {"type": "STRING", "nullable": True}
+                        },
+                        "required": ["topic_id", "title"]
+                    }
+                },
                 "decisions_log": {
                     "type": "ARRAY",
                     "items": {
@@ -134,7 +153,8 @@ def tamlelan_handler(cloud_event):
                             "statement": {"type": "STRING"},
                             "status": {"type": "STRING", "enum": ["decided", "proposed", "open"]},
                             "hedge_note": {"type": "STRING", "nullable": True},
-                            "source_quote": {"type": "STRING", "nullable": True}
+                            "source_quote": {"type": "STRING", "nullable": True},
+                            "related_topic_id": {"type": "STRING", "nullable": True}
                         },
                         "required": ["statement", "status"]
                     }
@@ -147,7 +167,8 @@ def tamlelan_handler(cloud_event):
                             "task": {"type": "STRING"},
                             "owner": {"type": "STRING", "nullable": True},
                             "deadline": {"type": "STRING", "nullable": True},
-                            "source_quote": {"type": "STRING", "nullable": True}
+                            "source_quote": {"type": "STRING", "nullable": True},
+                            "related_topic_id": {"type": "STRING", "nullable": True}
                         },
                         "required": ["task"]
                     }
@@ -205,12 +226,30 @@ def tamlelan_handler(cloud_event):
         # Fuzzy-match each source_quote against the transcript Pass 2 already
         # produced. Flags likely-hallucinated claims rather than dropping them --
         # a false-negative fuzzy match must not silently delete a true claim.
+        # Also checks related_topic_id referential integrity: a decision/action item
+        # claiming a link to a topic_id that doesn't actually exist among the
+        # extracted key_topics is flagged too (Defect 1 mitigation, Option B).
+        topics = res_data.get('key_topics') or []
+        known_topic_ids = {t.get('topic_id') for t in topics if isinstance(t, dict) and t.get('topic_id')}
+
+        for t in topics:
+            if isinstance(t, dict):
+                t['_grounded'] = is_grounded(t.get('source_quote'), full_transcript_text)
+
         for d in (res_data.get('decisions_log') or []):
             if isinstance(d, dict):
-                d['_grounded'] = is_grounded(d.get('source_quote'), full_transcript_text)
+                quote_ok = is_grounded(d.get('source_quote'), full_transcript_text)
+                topic_ref = d.get('related_topic_id')
+                topic_ref_ok = (topic_ref is None) or (topic_ref in known_topic_ids)
+                d['_grounded'] = quote_ok and topic_ref_ok
+
         for item in (res_data.get('action_items') or []):
             if isinstance(item, dict):
-                item['_grounded'] = is_grounded(item.get('source_quote'), full_transcript_text)
+                quote_ok = is_grounded(item.get('source_quote'), full_transcript_text)
+                topic_ref = item.get('related_topic_id')
+                topic_ref_ok = (topic_ref is None) or (topic_ref in known_topic_ids)
+                item['_grounded'] = quote_ok and topic_ref_ok
+
         print("[Step 4c] Grounding verification complete.")
 
         # ==========================================
@@ -223,6 +262,14 @@ def tamlelan_handler(cloud_event):
         action_items = res_data.get('action_items') or []
 
         STATUS_LABELS = {"decided": "הוחלט", "proposed": "הוצע", "open": "פתוח"}
+        topic_titles = {t.get('topic_id'): t.get('title') for t in key_topics
+                         if isinstance(t, dict) and t.get('topic_id')}
+
+        def topic_link_suffix(related_topic_id):
+            if not related_topic_id:
+                return ""
+            title = topic_titles.get(related_topic_id)
+            return f" _(קשור לנושא: {title})_" if title else " ⚠ _(הפניה לנושא לא תקין)_"
 
         md_summary = f"<div dir='rtl'>\n# סיכום פגישה\n\n"
         md_summary += f"## תקציר מנהלים\n{executive_summary}\n\n"
@@ -243,7 +290,13 @@ def tamlelan_handler(cloud_event):
         md_summary += "\n## נושאים מרכזיים\n"
         if not key_topics: md_summary += "* לא זוהו נושאים מרכזיים\n"
         else:
-            for t in key_topics: md_summary += f"* {t}\n"
+            for t in key_topics:
+                if isinstance(t, dict):
+                    title = t.get('title') or '-'
+                    warn_prefix = "⚠ " if not t.get('_grounded', True) else ""
+                    md_summary += f"* {warn_prefix}{title}\n"
+                else:
+                    md_summary += f"* {t}\n"
 
         md_summary += "\n## החלטות שהתקבלו\n"
         if not decisions: md_summary += "* לא התקבלו החלטות\n"
@@ -254,8 +307,9 @@ def tamlelan_handler(cloud_event):
                     status = STATUS_LABELS.get(d.get('status'), d.get('status') or '-')
                     hedge = d.get('hedge_note')
                     hedge_suffix = f" _({hedge})_" if hedge else ""
+                    link_suffix = topic_link_suffix(d.get('related_topic_id'))
                     warn_prefix = "⚠ " if not d.get('_grounded', True) else ""
-                    md_summary += f"* {warn_prefix}**[{status}]** {statement}{hedge_suffix}\n"
+                    md_summary += f"* {warn_prefix}**[{status}]** {statement}{hedge_suffix}{link_suffix}\n"
                 else:
                     md_summary += f"* {d}\n"
 
@@ -266,7 +320,8 @@ def tamlelan_handler(cloud_event):
             for item in action_items:
                 if isinstance(item, dict):
                     warn_prefix = "⚠ " if not item.get('_grounded', True) else ""
-                    md_summary += f"| {warn_prefix}{item.get('task') or '-'} | {item.get('owner') or '-'} | {item.get('deadline') or '-'} |\n"
+                    link_suffix = topic_link_suffix(item.get('related_topic_id'))
+                    md_summary += f"| {warn_prefix}{item.get('task') or '-'}{link_suffix} | {item.get('owner') or '-'} | {item.get('deadline') or '-'} |\n"
                 else:
                     md_summary += f"| {item} | - | - |\n"
         md_summary += "\n</div>"
