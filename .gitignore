@@ -11,6 +11,10 @@ __pycache__/
 *.pyc
 scribe.spec
 
+# Local virtual environments
+.venv-cloud/
+.venv-pipeline/
+
 # Runtime data / logs / backups
 Tamlelan_Backups/
 *.log

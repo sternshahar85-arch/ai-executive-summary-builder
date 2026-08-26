@@ -34,6 +34,7 @@ def tamlelan_handler(cloud_event):
     blob = bucket.blob(file_name)
     client = None
     gemini_file = None
+    succeeded = False
 
     try:
         blob.download_to_filename(local_audio_path)
@@ -207,6 +208,8 @@ def tamlelan_handler(cloud_event):
             print("[Step 7] Sending HTML Diagram to Drive...")
             send_to_drive(f"Diagram_{base_name}.html", html_content)
 
+        succeeded = True
+
     except Exception as e:
         print(f"[CRITICAL ERROR] Pipeline failed: {e}")
         raise e
@@ -214,8 +217,15 @@ def tamlelan_handler(cloud_event):
     finally:
         print("[Step 8] Cleaning up...")
         try:
-            if blob.exists(): blob.delete()
-        except Exception: pass
+            if blob.exists():
+                if succeeded:
+                    blob.delete()
+                else:
+                    print(f"[WARNING] Processing failed -- preserving source audio at failed/{file_name} instead of deleting it.")
+                    bucket.blob(f"failed/{file_name}").upload_from_string(blob.download_as_bytes())
+                    blob.delete()
+        except Exception as cleanup_err:
+            print(f"[WARNING] Cleanup could not preserve/delete source blob: {cleanup_err}")
         try:
             if gemini_file and client: client.files.delete(name=gemini_file.name)
         except Exception: pass
