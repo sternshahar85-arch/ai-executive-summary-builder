@@ -132,6 +132,20 @@ def format_diarization_for_prompt(diar):
     return "\n\n" + "\n".join(lines)
 
 
+def log_token_usage(label, response):
+    """Prints prompt/cached/total token counts for a Gemini response so cache
+    hits (cached_content_token_count > 0) are verifiable from Cloud Logging,
+    not just assumed from the cache having been created."""
+    try:
+        usage = response.usage_metadata
+        cached = getattr(usage, "cached_content_token_count", None)
+        prompt = getattr(usage, "prompt_token_count", None)
+        total = getattr(usage, "total_token_count", None)
+        print(f"[Usage] {label}: prompt_tokens={prompt} cached_tokens={cached} total_tokens={total}")
+    except Exception as usage_err:
+        print(f"[Usage] {label}: could not read usage_metadata ({usage_err})")
+
+
 @functions_framework.cloud_event
 def tamlelan_handler(cloud_event):
     event_id = cloud_event["id"]
@@ -353,7 +367,8 @@ def tamlelan_handler(cloud_event):
                 cached_content=cache.name if cache else None
             )
         )
-        
+        log_token_usage("Pass 1 (summary)", summary_response)
+
         raw_text = summary_response.text.replace("```json", "").replace("```", "").strip()
         
         try:
@@ -407,7 +422,8 @@ def tamlelan_handler(cloud_event):
                 cached_content=cache.name if cache else None
             )
         )
-        
+        log_token_usage("Pass 2 (transcript)", transcript_response)
+
         full_transcript_text = transcript_response.text.strip()
         if not full_transcript_text:
             full_transcript_text = "לא זוהה מלל."
