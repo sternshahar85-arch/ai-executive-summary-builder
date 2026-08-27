@@ -110,6 +110,135 @@ class TestBuildDiarizationPayload(unittest.TestCase):
         mock_diarize.assert_not_called()
 
 
+class TestExpectedParticipants(unittest.TestCase):
+    """
+    Real-world testing (2 remote participants) showed automatic clustering
+    (num_clusters=-1) badly over-segmenting real Zoom audio into 16+ spurious
+    labels. expected_participants lets the user supply the true count instead.
+    """
+
+    def _fake_diarize_channel(self, calls):
+        def fake(samples, label_prefix, num_clusters=-1):
+            calls.append((label_prefix, num_clusters))
+            return [(0.0, 1.0, f"{label_prefix}00")]
+        return fake
+
+    def test_stereo_with_4_total_participants_remote_gets_3(self):
+        calls = []
+        with patch("scribe.diarize_channel", side_effect=self._fake_diarize_channel(calls)):
+            payload = scribe.build_diarization_payload(
+                np.zeros(100), np.zeros(100), has_loopback=True, duration_sec=6.0,
+                expected_participants=4)
+        self.assertIn(("OPERATOR", 1), calls)  # operator always fixed at 1
+        self.assertIn(("REMOTE_", 3), calls)   # 4 total - 1 operator = 3 remote
+        self.assertEqual(payload["expected_participants"], 4)
+
+    def test_mono_with_3_participants_passed_directly(self):
+        calls = []
+        with patch("scribe.diarize_channel", side_effect=self._fake_diarize_channel(calls)):
+            payload = scribe.build_diarization_payload(
+                np.zeros(100), np.zeros(100), has_loopback=False, duration_sec=6.0,
+                expected_participants=3)
+        self.assertIn(("SPEAKER_", 3), calls)
+        self.assertEqual(payload["expected_participants"], 3)
+
+    def test_none_falls_back_to_automatic_stereo(self):
+        calls = []
+        with patch("scribe.diarize_channel", side_effect=self._fake_diarize_channel(calls)):
+            payload = scribe.build_diarization_payload(
+                np.zeros(100), np.zeros(100), has_loopback=True, duration_sec=6.0,
+                expected_participants=None)
+        self.assertIn(("REMOTE_", -1), calls)  # unchanged from pre-existing behavior
+        self.assertIsNone(payload["expected_participants"])
+
+    def test_solo_stereo_call_of_1_falls_back_to_automatic_remote(self):
+        # A count of 1 (just the operator, e.g. testing alone) doesn't make sense
+        # as "0 remote speakers" -- fall back to automatic rather than requesting
+        # an invalid num_clusters=0.
+        calls = []
+        with patch("scribe.diarize_channel", side_effect=self._fake_diarize_channel(calls)):
+            scribe.build_diarization_payload(
+                np.zeros(100), np.zeros(100), has_loopback=True, duration_sec=6.0,
+                expected_participants=1)
+        self.assertIn(("REMOTE_", -1), calls)
+
+    def test_mono_zero_or_negative_falls_back_to_automatic(self):
+        calls = []
+        with patch("scribe.diarize_channel", side_effect=self._fake_diarize_channel(calls)):
+            scribe.build_diarization_payload(
+                np.zeros(100), np.zeros(100), has_loopback=False, duration_sec=6.0,
+                expected_participants=0)
+        self.assertIn(("SPEAKER_", -1), calls)
+
+
+class TestStartRecordingParsesParticipantsVar(unittest.TestCase):
+    """Verifies the GUI-facing parsing logic in start_recording, without
+    actually creating a Tk window (a plain object with .get() stands in for
+    the StringVar)."""
+
+    class FakeVar:
+        def __init__(self, value):
+            self._value = value
+        def get(self):
+            return self._value
+
+    class FakeWidget:
+        def config(self, **kwargs):
+            pass
+
+    def test_valid_number_threads_through_to_recording_thread(self):
+        captured_args = {}
+
+        def fake_thread_init(self, target, args, daemon):
+            captured_args["args"] = args
+            self._target, self._args = target, args
+        def fake_start(self):
+            pass
+
+        with patch("scribe.threading.Thread.__init__", fake_thread_init), \
+             patch("scribe.threading.Thread.start", fake_start), \
+             patch("scribe.update_meter_ui"):
+            scribe.start_recording(
+                self.FakeWidget(), self.FakeWidget(), self.FakeWidget(),
+                self.FakeWidget(), self.FakeWidget(), self.FakeVar("5"))
+
+        self.assertEqual(captured_args["args"][3], 5)
+
+    def test_blank_value_results_in_none(self):
+        captured_args = {}
+
+        def fake_thread_init(self, target, args, daemon):
+            captured_args["args"] = args
+        def fake_start(self):
+            pass
+
+        with patch("scribe.threading.Thread.__init__", fake_thread_init), \
+             patch("scribe.threading.Thread.start", fake_start), \
+             patch("scribe.update_meter_ui"):
+            scribe.start_recording(
+                self.FakeWidget(), self.FakeWidget(), self.FakeWidget(),
+                self.FakeWidget(), self.FakeWidget(), self.FakeVar(""))
+
+        self.assertIsNone(captured_args["args"][3])
+
+    def test_no_participants_var_results_in_none_backward_compatible(self):
+        captured_args = {}
+
+        def fake_thread_init(self, target, args, daemon):
+            captured_args["args"] = args
+        def fake_start(self):
+            pass
+
+        with patch("scribe.threading.Thread.__init__", fake_thread_init), \
+             patch("scribe.threading.Thread.start", fake_start), \
+             patch("scribe.update_meter_ui"):
+            scribe.start_recording(
+                self.FakeWidget(), self.FakeWidget(), self.FakeWidget(),
+                self.FakeWidget(), self.FakeWidget())
+
+        self.assertIsNone(captured_args["args"][3])
+
+
 class TestDiarizeChannelDtypeConversion(unittest.TestCase):
     def test_int16_input_reaches_diarizer_as_float32_in_range(self):
         captured = {}

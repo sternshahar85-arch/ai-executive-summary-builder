@@ -180,7 +180,7 @@ def merge_speaker_segments(segments, gap=DIAR_MERGE_GAP_SEC):
     return [tuple(m) for m in merged]
 
 
-def build_diarization_payload(mic_array, sys_array, has_loopback, duration_sec):
+def build_diarization_payload(mic_array, sys_array, has_loopback, duration_sec, expected_participants=None):
     """
     Channel-selection logic:
     - Stereo (has_loopback=True, e.g. a 3+-person Zoom call): diarize the RIGHT
@@ -191,12 +191,25 @@ def build_diarization_payload(mic_array, sys_array, has_loopback, duration_sec):
     - Mono (has_loopback=False, in-room case): diarize the full mono track --
       no privileged "operator" identity, since there's no channel signal at all.
 
+    expected_participants (optional, total headcount including the operator):
+    real-world testing showed automatic clustering (num_clusters=-1) badly
+    over-segments real Zoom audio -- a 2-remote-person meeting produced 16+
+    distinct spurious labels, mostly from short utterances/background noise.
+    Supplying the true count (sherpa-onnx's own docs recommend this) fixes the
+    cluster count directly instead of leaving it to a similarity threshold that
+    real, noisy audio doesn't cleanly meet. When not supplied, falls back to
+    automatic detection exactly as before.
+
     Returns None on ANY failure. Diarization must never cost the user a recording.
     """
     if not DIARIZATION_ENABLED:
         return None
     try:
         if has_loopback:
+            remote_num_clusters = -1
+            if expected_participants and expected_participants >= 2:
+                remote_num_clusters = expected_participants - 1
+
             # num_clusters=1 guarantees exactly one distinct label on this channel
             # by construction -- relabel uniformly to plain "OPERATOR" rather than
             # trusting diarize_channel's f"{prefix}{speaker:02d}" formatting (which
@@ -204,7 +217,7 @@ def build_diarization_payload(mic_array, sys_array, has_loopback, duration_sec):
             # below depends on the exact string "OPERATOR".
             operator_segments = [(s, e, "OPERATOR") for s, e, _ in
                                   diarize_channel(mic_array, "OPERATOR", num_clusters=1)]
-            remote_segments = diarize_channel(sys_array, "REMOTE_", num_clusters=-1)
+            remote_segments = diarize_channel(sys_array, "REMOTE_", num_clusters=remote_num_clusters)
             all_segments = merge_speaker_segments(operator_segments + remote_segments)
             labels = {seg[2] for seg in all_segments}
             speaker_count = len(labels)
@@ -214,7 +227,8 @@ def build_diarization_payload(mic_array, sys_array, has_loopback, duration_sec):
             ]
             channel_mode = "stereo_operator_left"
         else:
-            mono_segments = merge_speaker_segments(diarize_channel(mic_array, "SPEAKER_", num_clusters=-1))
+            mono_num_clusters = expected_participants if (expected_participants and expected_participants >= 1) else -1
+            mono_segments = merge_speaker_segments(diarize_channel(mic_array, "SPEAKER_", num_clusters=mono_num_clusters))
             all_segments = mono_segments
             labels = {seg[2] for seg in all_segments}
             speaker_count = len(labels)
@@ -226,6 +240,7 @@ def build_diarization_payload(mic_array, sys_array, has_loopback, duration_sec):
             "channel_mode": channel_mode,
             "sample_rate": TARGET_SAMPLE_RATE,
             "duration_sec": duration_sec,
+            "expected_participants": expected_participants,
             "speaker_count": speaker_count,
             "speakers": speakers,
             "segments": [[round(s, 2), round(e, 2), lbl] for s, e, lbl in sorted(all_segments)],
@@ -339,7 +354,7 @@ def update_meter_ui(vol_canvas, vol_bar):
     else:
         vol_canvas.coords(vol_bar, 0, 0, 0, 20)
 
-def recording_thread_task(status_label, start_btn, end_btn):
+def recording_thread_task(status_label, start_btn, end_btn, expected_participants=None):
     global is_recording, mic_frames, sys_frames, current_mic_rms, current_sys_rms
     
     mic_frames = []
@@ -496,7 +511,8 @@ def recording_thread_task(status_label, start_btn, end_btn):
             root_window.after(0, lambda: status_label.config(text="Status: Analyzing speakers..."))
             diar_payload = build_diarization_payload(
                 mic_array, sys_array, bool(default_loopback),
-                duration_sec=len(mic_array) / TARGET_SAMPLE_RATE)
+                duration_sec=len(mic_array) / TARGET_SAMPLE_RATE,
+                expected_participants=expected_participants)
             if diar_payload:
                 # Permanent local copy, alongside the audio backup -- unlike the
                 # audio itself, NOT subject to the 7-day clean_old_backups() sweep;
@@ -526,18 +542,27 @@ def recording_thread_task(status_label, start_btn, end_btn):
         root_window.after(0, lambda: start_btn.config(state=tk.NORMAL))
         root_window.after(0, lambda: end_btn.config(state=tk.DISABLED))
 
-def start_recording(status_label, start_btn, end_btn, vol_canvas, vol_bar):
+def start_recording(status_label, start_btn, end_btn, vol_canvas, vol_bar, participants_var=None):
     global is_recording
     is_recording = True
     status_label.config(text="Status: Recording... (Mic + System)")
     start_btn.config(state=tk.DISABLED)
     end_btn.config(state=tk.NORMAL)
-    
+
+    expected_participants = None
+    if participants_var is not None:
+        try:
+            value = int(participants_var.get())
+            if value >= 1:
+                expected_participants = value
+        except (ValueError, tk.TclError):
+            pass  # left blank or invalid -- falls back to automatic detection
+
     update_meter_ui(vol_canvas, vol_bar)
-    
+
     threading.Thread(
-        target=recording_thread_task, 
-        args=(status_label, start_btn, end_btn), 
+        target=recording_thread_task,
+        args=(status_label, start_btn, end_btn, expected_participants),
         daemon=True
     ).start()
 
@@ -551,7 +576,7 @@ def create_gui():
     global root_window
     root_window = tk.Tk()
     root_window.title("TAMLELAN Client V1.1")
-    root_window.geometry("350x250")
+    root_window.geometry("350x290")
     root_window.resizable(False, False)
 
     title_label = tk.Label(root_window, text="TAMLELAN Meeting Agent", font=("Helvetica", 14, "bold"))
@@ -570,13 +595,23 @@ def create_gui():
     vol_canvas.pack(side=tk.LEFT)
     vol_bar = vol_canvas.create_rectangle(0, 0, 0, 20, fill='limegreen')
 
+    participants_frame = tk.Frame(root_window)
+    participants_frame.pack(pady=5)
+
+    participants_label = tk.Label(participants_frame, text="Participants (incl. you):", font=("Helvetica", 9))
+    participants_label.pack(side=tk.LEFT, padx=5)
+
+    participants_var = tk.StringVar(value="2")
+    participants_spinbox = tk.Spinbox(participants_frame, from_=1, to=20, width=4, textvariable=participants_var)
+    participants_spinbox.pack(side=tk.LEFT)
+
     btn_frame = tk.Frame(root_window)
     btn_frame.pack(pady=15)
 
     start_btn = tk.Button(btn_frame, text="START", font=("Helvetica", 12), bg="green", fg="white", width=10)
     end_btn = tk.Button(btn_frame, text="END", font=("Helvetica", 12), bg="red", fg="white", width=10, state=tk.DISABLED)
 
-    start_btn.config(command=lambda: start_recording(status_label, start_btn, end_btn, vol_canvas, vol_bar))
+    start_btn.config(command=lambda: start_recording(status_label, start_btn, end_btn, vol_canvas, vol_bar, participants_var))
     end_btn.config(command=lambda: stop_recording(status_label))
 
     start_btn.grid(row=0, column=0, padx=10)
