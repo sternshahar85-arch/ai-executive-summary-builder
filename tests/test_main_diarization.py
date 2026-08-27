@@ -124,6 +124,7 @@ def make_fake_genai_client(summary_fixture):
     client.files.upload.return_value = FakeGeminiFile()
     client.files.get.return_value = FakeGeminiFile()
     client.files.delete.return_value = None
+    client.caches.create.return_value.name = "cachedContents/fake123"
 
     summary_response = MagicMock()
     summary_response.text = json.dumps(summary_fixture)
@@ -290,6 +291,7 @@ class TestCompanionCleanup(unittest.TestCase):
         fake_client.files.upload.return_value = FakeGeminiFile()
         fake_client.files.get.return_value = FakeGeminiFile()
         fake_client.files.delete.return_value = None
+        fake_client.caches.create.return_value.name = "cachedContents/fake123"
         bad_response = MagicMock()
         bad_response.text = bad_fixture
         fake_client.models.generate_content.side_effect = [bad_response]

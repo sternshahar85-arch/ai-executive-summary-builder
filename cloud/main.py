@@ -158,6 +158,7 @@ def tamlelan_handler(cloud_event):
     blob = bucket.blob(file_name)
     client = None
     gemini_file = None
+    cache = None
     succeeded = False
 
     try:
@@ -177,7 +178,26 @@ def tamlelan_handler(cloud_event):
         while gemini_file.state.name == "PROCESSING":
             time.sleep(2)
             gemini_file = client.files.get(name=gemini_file.name)
-        
+
+        # Explicit context cache: the audio is sent to Gemini twice (Pass 1 + Pass 2)
+        # below, so caching it once here means Pass 2 reads it back at ~10% of the
+        # input-token price instead of paying full price again. Falls back to the
+        # uncached path on any failure (e.g. audio too short to meet the cache's
+        # minimum token count) -- this must never be able to break the pipeline.
+        cache = None
+        try:
+            cache = client.caches.create(
+                model='gemini-3.1-pro-preview',
+                config=types.CreateCachedContentConfig(
+                    contents=[gemini_file],
+                    ttl="600s",
+                )
+            )
+            print(f"[Step 2b] Audio cached ({cache.name}) for reuse across both passes.")
+        except Exception as cache_err:
+            print(f"[WARNING] Context cache creation failed, falling back to uncached calls: {cache_err}")
+            cache = None
+
         # ==========================================
         # PASS 1: THE STRUCTURED SUMMARY (JSON)
         # ==========================================
@@ -325,11 +345,12 @@ def tamlelan_handler(cloud_event):
         
         summary_response = client.models.generate_content(
             model='gemini-3.1-pro-preview',
-            contents=[summary_prompt + diar_block, gemini_file],
+            contents=[summary_prompt + diar_block] + ([] if cache else [gemini_file]),
             config=types.GenerateContentConfig(
-                response_mime_type="application/json", 
+                response_mime_type="application/json",
                 response_schema=schema,
-                temperature=0.2
+                temperature=0.2,
+                cached_content=cache.name if cache else None
             )
         )
         
@@ -379,10 +400,11 @@ def tamlelan_handler(cloud_event):
         
         transcript_response = client.models.generate_content(
             model='gemini-3.1-pro-preview',
-            contents=[transcript_prompt + diar_block, gemini_file],
+            contents=[transcript_prompt + diar_block] + ([] if cache else [gemini_file]),
             config=types.GenerateContentConfig(
                 response_mime_type="text/plain",
-                temperature=0.1
+                temperature=0.1,
+                cached_content=cache.name if cache else None
             )
         )
         
@@ -615,6 +637,9 @@ def tamlelan_handler(cloud_event):
             print(f"[WARNING] Cleanup could not preserve/delete diarization companion: {cleanup_err}")
         try:
             if gemini_file and client: client.files.delete(name=gemini_file.name)
+        except Exception: pass
+        try:
+            if cache and client: client.caches.delete(name=cache.name)
         except Exception: pass
         try:
             if os.path.exists(local_audio_path): os.remove(local_audio_path)

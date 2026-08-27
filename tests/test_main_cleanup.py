@@ -79,6 +79,7 @@ def make_fake_genai_client(summary_ok=True):
     client.files.upload.return_value = FakeGeminiFile()
     client.files.get.return_value = FakeGeminiFile()
     client.files.delete.return_value = None
+    client.caches.create.return_value.name = "cachedContents/fake123"
 
     summary_json = json.dumps({
         "executive_summary": "Test summary",
@@ -164,6 +165,52 @@ class TestCleanupOnFailure(unittest.TestCase):
             b"FAKE_AUDIO_BYTES",
             "The failed/ copy must contain the actual audio bytes, not be empty",
         )
+
+
+class TestCacheCreationFallback(unittest.TestCase):
+    """If client.caches.create() fails (e.g. audio too short to meet the cache's
+    minimum token count, or a transient API error), the pipeline must still
+    succeed by falling back to passing the audio file directly into each pass --
+    never fail because of the caching optimization itself."""
+
+    def test_pipeline_succeeds_when_cache_creation_raises(self):
+        bucket = FakeBucket()
+        client = make_fake_genai_client(summary_ok=True)
+        client.caches.create.side_effect = Exception("cache too small")
+
+        with patch("main.storage.Client") as mock_storage_client, \
+             patch("main.genai.Client", return_value=client), \
+             patch("main.urllib.request.urlopen") as mock_urlopen:
+
+            mock_storage_client.return_value.bucket.return_value = bucket
+
+            fake_response = MagicMock()
+            fake_response.read.return_value = json.dumps({"status": "ok"}).encode()
+            mock_urlopen.return_value.__enter__.return_value = fake_response
+
+            os.environ["APPS_SCRIPT_URL"] = "https://example.invalid/webhook"
+            os.environ["DRIVE_FOLDER_ID"] = "fake_folder"
+            os.environ["WEBHOOK_SECRET"] = "fake_secret"
+            os.environ["GEMINI_API_KEY"] = "fake_key"
+
+            import main
+            event = FakeCloudEvent("evt-cache-fallback-1", "fake-bucket", "meeting.wav")
+            result = main.tamlelan_handler(event)
+
+        self.assertEqual(result, ("Success", 200))
+        self.assertIn("meeting.wav", bucket.deleted_paths)
+
+        # Both passes must have fallen back to passing the Gemini file object
+        # directly, with no cached_content reference, since the cache was never
+        # created.
+        for call in client.models.generate_content.call_args_list:
+            self.assertIsNone(call.kwargs["config"].cached_content)
+            self.assertEqual(len(call.kwargs["contents"]), 2,
+                              "Fallback path must include the gemini_file alongside the prompt")
+
+        # The cache-delete cleanup step must not blow up when there was never a
+        # cache to delete.
+        client.caches.delete.assert_not_called()
 
 
 if __name__ == "__main__":

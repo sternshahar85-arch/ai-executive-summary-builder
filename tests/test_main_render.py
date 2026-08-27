@@ -96,6 +96,7 @@ def make_fake_genai_client():
     client.files.upload.return_value = FakeGeminiFile()
     client.files.get.return_value = FakeGeminiFile()
     client.files.delete.return_value = None
+    client.caches.create.return_value.name = "cachedContents/fake123"
 
     summary_response = MagicMock()
     summary_response.text = json.dumps(SUMMARY_FIXTURE)
