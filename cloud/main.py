@@ -30,7 +30,7 @@ def tamlelan_handler(cloud_event):
     bucket_name = data["bucket"]
     file_name = data["name"]
     
-    if file_name.startswith("locks/") or not file_name.endswith(".wav"):
+    if file_name.startswith("locks/") or file_name.startswith("failed/") or not file_name.endswith(".wav"):
         return "Ignored", 200
 
     print(f"[Step 1] Waking up for Event ID {event_id} | File: {file_name}...")
@@ -81,9 +81,29 @@ def tamlelan_handler(cloud_event):
         1. Provide an executive summary, key topics, decisions, and action items.
         2. Evaluate if technical architectures or system designs were discussed (diagram_needed).
 
-        Attendees: list every person mentioned by name. If their role or organization is
-        stated (e.g. in an introduction), include it. If not stated, leave it null -- do
-        not guess.
+        Attendees: list ONLY the people who actually PARTICIPATED in this meeting -- that
+        is, people whose own voice you can hear speaking in the recording. A person counts
+        as an attendee only if they speak.
+
+        Do NOT list a person merely because their name was said out loud. People who are
+        talked ABOUT -- students, customers, suppliers, colleagues from other teams,
+        absent managers, third parties -- are NOT attendees, no matter how often their
+        name comes up. If you are unsure whether a given name belongs to a voice you can
+        actually hear, leave that person OUT of attendees (see people_mentioned below
+        instead).
+
+        Most meetings have between 2 and 6 attendees. If your attendees list is longer
+        than the number of distinct voices you can hear, it is wrong -- remove the names
+        you cannot match to a voice.
+
+        For each attendee, if their role or organization is stated (e.g. in an
+        introduction), include it. If not stated, leave it null -- do not guess.
+
+        People mentioned: separately, list every OTHER named person who came up in the
+        conversation but did not speak -- students, customers, suppliers, third parties,
+        anyone talked about rather than heard. For each, give a short context string
+        describing what they were mentioned in relation to (e.g. "student receiving a
+        certificate", "supplier for the closing ceremony catering").
 
         Decisions: for each decision-like statement, classify its status:
         - "decided": the group reached a final, settled conclusion.
@@ -133,6 +153,17 @@ def tamlelan_handler(cloud_event):
                         "required": ["name"]
                     }
                 },
+                "people_mentioned": {
+                    "type": "ARRAY",
+                    "items": {
+                        "type": "OBJECT",
+                        "properties": {
+                            "name": {"type": "STRING"},
+                            "context": {"type": "STRING", "nullable": True}
+                        },
+                        "required": ["name"]
+                    }
+                },
                 "key_topics": {
                     "type": "ARRAY",
                     "items": {
@@ -175,7 +206,7 @@ def tamlelan_handler(cloud_event):
                 },
                 "diagram_needed": {"type": "BOOLEAN"}
             },
-            "required": ["executive_summary", "attendees", "key_topics", "decisions_log", "action_items", "diagram_needed"]
+            "required": ["executive_summary", "attendees", "people_mentioned", "key_topics", "decisions_log", "action_items", "diagram_needed"]
         }
         
         summary_response = client.models.generate_content(
@@ -257,6 +288,7 @@ def tamlelan_handler(cloud_event):
         # ==========================================
         executive_summary = res_data.get('executive_summary') or "לא זוהה מידע בולט בהקלטה."
         attendees = res_data.get('attendees') or []
+        people_mentioned = res_data.get('people_mentioned') or []
         key_topics = res_data.get('key_topics') or []
         decisions = res_data.get('decisions_log') or []
         action_items = res_data.get('action_items') or []
@@ -286,6 +318,18 @@ def tamlelan_handler(cloud_event):
                     md_summary += f"* {name}{detail}\n"
                 else:
                     md_summary += f"* {a}\n"
+
+        md_summary += "\n## אנשים שהוזכרו\n"
+        if not people_mentioned: md_summary += "* לא הוזכרו אנשים נוספים\n"
+        else:
+            for p in people_mentioned:
+                if isinstance(p, dict):
+                    name = p.get('name') or '-'
+                    context = p.get('context')
+                    detail = f" ({context})" if context else ""
+                    md_summary += f"* {name}{detail}\n"
+                else:
+                    md_summary += f"* {p}\n"
 
         md_summary += "\n## נושאים מרכזיים\n"
         if not key_topics: md_summary += "* לא זוהו נושאים מרכזיים\n"
