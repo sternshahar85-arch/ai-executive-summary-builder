@@ -13,7 +13,12 @@ echo [2/3] Compiling scribe.py into standalone executable...
 :: --noconsole hides the CMD window
 :: --onefile packages everything into a single .exe
 :: service_account.json is NOT bundled - place it next to scribe.exe after building
-python -m PyInstaller --noconsole --onefile scribe.py
+:: models\ (diarization ONNX files) is NOT bundled either - downloaded on first
+::   run next to scribe.exe, or can be dropped in manually for an offline install
+:: --collect-all sherpa_onnx: sherpa_onnx ships native DLLs alongside its Python
+::   extension that PyInstaller's onefile analysis misses by default -- without
+::   this flag the exe builds fine but crashes at runtime on import
+python -m PyInstaller --noconsole --onefile --collect-all sherpa_onnx scribe.py
 
 echo.
 echo [3/3] Verifying build...

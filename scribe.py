@@ -2,6 +2,7 @@ import os
 import sys
 import time
 import math
+import json
 import logging
 import uuid
 import threading
@@ -20,6 +21,18 @@ import pyaudiowpatch as pyaudio
 TARGET_SAMPLE_RATE = 16000
 BUCKET_NAME = "tamlelan-inbox-stgliding"
 DEAD_MIC_THRESHOLD = 50
+
+# Local speaker diarization (sherpa-onnx, CPU-only, no GCP cost)
+DIARIZATION_ENABLED = True
+DIAR_CLUSTER_THRESHOLD = 0.5
+DIAR_MIN_DURATION_ON = 0.3
+DIAR_MIN_DURATION_OFF = 0.5
+DIAR_MERGE_GAP_SEC = 0.8
+DIARIZATION_SCHEMA_VERSION = 1
+SEGMENTATION_MODEL_URL = "https://github.com/k2-fsa/sherpa-onnx/releases/download/speaker-segmentation-models/sherpa-onnx-pyannote-segmentation-3-0.tar.bz2"
+SEGMENTATION_MODEL_SIZE = 6958444
+EMBEDDING_MODEL_URL = "https://github.com/k2-fsa/sherpa-onnx/releases/download/speaker-recongition-models/3dspeaker_speech_campplus_sv_zh_en_16k-common_advanced.onnx"
+EMBEDDING_MODEL_SIZE = 28281164
 
 # Global state
 is_recording = False
@@ -61,6 +74,166 @@ def build_output_audio(mic_array, sys_array, has_loopback):
         return np.column_stack((mic_int16, sys_int16))
     return mic_int16
 
+
+def _download_file(url, dest_path, expected_size=None):
+    """Plain stdlib download (urllib) for a single file."""
+    import urllib.request
+    os.makedirs(os.path.dirname(dest_path), exist_ok=True)
+    urllib.request.urlretrieve(url, dest_path)
+    if expected_size and os.path.getsize(dest_path) != expected_size:
+        logging.warning(
+            f"Downloaded file {dest_path} size {os.path.getsize(dest_path)} "
+            f"does not match expected {expected_size} -- may be corrupt or the "
+            f"upstream release changed.")
+
+
+def _download_and_extract_tar(url, extract_dir):
+    """Downloads a .tar.bz2 and extracts it into extract_dir. The archive
+    already contains its own top-level folder (e.g. sherpa-onnx-pyannote-
+    segmentation-3-0/model.onnx) -- extract_dir must be the PARENT of that
+    folder, not the folder itself, or paths double up."""
+    import urllib.request
+    import tarfile
+    os.makedirs(extract_dir, exist_ok=True)
+    tmp_path = os.path.join(extract_dir, "_download.tar.bz2")
+    urllib.request.urlretrieve(url, tmp_path)
+    with tarfile.open(tmp_path, "r:bz2") as tar:
+        tar.extractall(extract_dir)
+    os.remove(tmp_path)
+
+
+def get_model_paths():
+    """
+    Resolves the local paths to the two ONNX models diarization needs, next to
+    the exe (not _MEIPASS -- must survive rebuilds, matching service_account.json's
+    placement). Triggers a one-time download on first run if absent; a user can
+    also drop the model files into this folder manually for an offline install.
+    """
+    models_dir = os.path.join(get_executable_dir(), "models")
+    segmentation_path = os.path.join(
+        models_dir, "sherpa-onnx-pyannote-segmentation-3-0", "model.onnx")
+    embedding_path = os.path.join(
+        models_dir, "3dspeaker_speech_campplus_sv_zh_en_16k-common_advanced.onnx")
+
+    if not os.path.exists(segmentation_path):
+        logging.info("Diarization segmentation model not found locally -- downloading (one-time, ~7MB)...")
+        _download_and_extract_tar(SEGMENTATION_MODEL_URL, models_dir)
+    if not os.path.exists(embedding_path):
+        logging.info("Diarization embedding model not found locally -- downloading (one-time, ~28MB)...")
+        _download_file(EMBEDDING_MODEL_URL, embedding_path, EMBEDDING_MODEL_SIZE)
+
+    return segmentation_path, embedding_path
+
+
+def _make_diarizer(num_clusters=-1):
+    """Lazy import of sherpa_onnx -- keeps scribe.exe startup fast, and lets this
+    module still be imported for testing on a machine without sherpa-onnx
+    installed (only this function and diarize_channel touch the import)."""
+    import sherpa_onnx
+
+    segmentation_path, embedding_path = get_model_paths()
+    config = sherpa_onnx.OfflineSpeakerDiarizationConfig(
+        segmentation=sherpa_onnx.OfflineSpeakerSegmentationModelConfig(
+            pyannote=sherpa_onnx.OfflineSpeakerSegmentationPyannoteModelConfig(
+                model=segmentation_path,
+            ),
+        ),
+        embedding=sherpa_onnx.SpeakerEmbeddingExtractorConfig(model=embedding_path),
+        clustering=sherpa_onnx.FastClusteringConfig(
+            num_clusters=num_clusters, threshold=DIAR_CLUSTER_THRESHOLD),
+        min_duration_on=DIAR_MIN_DURATION_ON,
+        min_duration_off=DIAR_MIN_DURATION_OFF,
+    )
+    config.validate()
+    return sherpa_onnx.OfflineSpeakerDiarization(config)
+
+
+def diarize_channel(samples, label_prefix, num_clusters=-1):
+    """Runs local diarization on one channel's samples (int16 or float64 --
+    process_audio returns int16 when no resampling ran, float64 when
+    resample_poly did). Returns a list of (start, end, label) tuples."""
+    arr = np.asarray(samples)
+    if arr.dtype != np.float32:
+        if np.issubdtype(arr.dtype, np.integer):
+            arr = arr.astype(np.float32) / 32768.0
+        else:
+            arr = (arr / 32768.0).astype(np.float32)
+
+    diarizer = _make_diarizer(num_clusters=num_clusters)
+    result = diarizer.process(arr).sort_by_start_time()
+    return [(r.start, r.end, f"{label_prefix}{r.speaker:02d}") for r in result]
+
+
+def merge_speaker_segments(segments, gap=DIAR_MERGE_GAP_SEC):
+    """Pure, no sherpa dependency. Merges temporally adjacent same-label
+    segments separated by less than `gap` seconds, bounding payload/prompt size."""
+    if not segments:
+        return []
+    ordered = sorted(segments, key=lambda s: s[0])
+    merged = [list(ordered[0])]
+    for start, end, label in ordered[1:]:
+        last = merged[-1]
+        if label == last[2] and start - last[1] < gap:
+            last[1] = max(last[1], end)
+        else:
+            merged.append([start, end, label])
+    return [tuple(m) for m in merged]
+
+
+def build_diarization_payload(mic_array, sys_array, has_loopback, duration_sec):
+    """
+    Channel-selection logic:
+    - Stereo (has_loopback=True, e.g. a 3+-person Zoom call): diarize the RIGHT
+      (system/remote) channel to separate multiple remote voices -- Zoom already
+      mixed them down before this ever saw the audio, and nothing else
+      distinguishes them. Diarize the LEFT (mic) channel with num_clusters=1 for
+      a free operator speech-activity timeline via the same code path.
+    - Mono (has_loopback=False, in-room case): diarize the full mono track --
+      no privileged "operator" identity, since there's no channel signal at all.
+
+    Returns None on ANY failure. Diarization must never cost the user a recording.
+    """
+    if not DIARIZATION_ENABLED:
+        return None
+    try:
+        if has_loopback:
+            # num_clusters=1 guarantees exactly one distinct label on this channel
+            # by construction -- relabel uniformly to plain "OPERATOR" rather than
+            # trusting diarize_channel's f"{prefix}{speaker:02d}" formatting (which
+            # would produce "OPERATOR00"), since the channel/label equality check
+            # below depends on the exact string "OPERATOR".
+            operator_segments = [(s, e, "OPERATOR") for s, e, _ in
+                                  diarize_channel(mic_array, "OPERATOR", num_clusters=1)]
+            remote_segments = diarize_channel(sys_array, "REMOTE_", num_clusters=-1)
+            all_segments = merge_speaker_segments(operator_segments + remote_segments)
+            labels = {seg[2] for seg in all_segments}
+            speaker_count = len(labels)
+            speakers = [
+                {"label": lbl, "channel": "left" if lbl == "OPERATOR" else "right"}
+                for lbl in sorted(labels)
+            ]
+            channel_mode = "stereo_operator_left"
+        else:
+            mono_segments = merge_speaker_segments(diarize_channel(mic_array, "SPEAKER_", num_clusters=-1))
+            all_segments = mono_segments
+            labels = {seg[2] for seg in all_segments}
+            speaker_count = len(labels)
+            speakers = [{"label": lbl, "channel": "mono"} for lbl in sorted(labels)]
+            channel_mode = "mono_single_track"
+
+        return {
+            "schema_version": DIARIZATION_SCHEMA_VERSION,
+            "channel_mode": channel_mode,
+            "sample_rate": TARGET_SAMPLE_RATE,
+            "duration_sec": duration_sec,
+            "speaker_count": speaker_count,
+            "speakers": speakers,
+            "segments": [[round(s, 2), round(e, 2), lbl] for s, e, lbl in sorted(all_segments)],
+        }
+    except Exception:
+        logging.exception("Local diarization failed -- continuing without it (recording is unaffected):")
+        return None
+
 # ==========================================
 # PATH RESOLUTION & LOGGING
 # ==========================================
@@ -94,6 +267,10 @@ def clean_old_backups():
     
     now = time.time()
     for filename in os.listdir(backup_dir):
+        # Diarization companion backups are small and deliberately kept longer
+        # than the 7-day audio retention window -- not swept here.
+        if filename.endswith(".diarization.json"):
+            continue
         file_path = os.path.join(backup_dir, filename)
         if os.path.isfile(file_path):
             # If file is older than 7 days (7 * 24 * 60 * 60 seconds)
@@ -104,24 +281,46 @@ def clean_old_backups():
                 except Exception as e:
                     logging.error(f"Failed to delete old backup {filename}: {e}")
 
-def upload_to_gcp(file_path):
+def upload_to_gcp(file_path, diar_payload=None):
     logging.info("Authenticating with GCP...")
     cred_path = os.path.join(get_executable_dir(), 'service_account.json')
-    
+
     if not os.path.exists(cred_path):
         raise FileNotFoundError(f"Credentials not found at {cred_path}")
 
     credentials = service_account.Credentials.from_service_account_file(cred_path)
     client = storage.Client(credentials=credentials, project=credentials.project_id)
-    
+
     bucket = client.bucket(BUCKET_NAME)
-    blob_name = f"tamlelan_audio_{uuid.uuid4().hex}.wav"
+    stem = f"tamlelan_audio_{uuid.uuid4().hex}"  # one shared stem for both objects
+    companion_blob = None
+
+    # ORDER IS LOAD-BEARING: the companion must be fully uploaded BEFORE the
+    # .wav, because the .wav's own finalize event is what triggers the cloud
+    # function -- GCS's read-after-write consistency then guarantees the
+    # companion is already present by the time the handler runs.
+    if diar_payload:
+        companion_blob = bucket.blob(f"{stem}.diarization.json")
+        logging.info(f"Uploading diarization companion to gs://{BUCKET_NAME}/{stem}.diarization.json...")
+        companion_blob.upload_from_string(
+            json.dumps(diar_payload, ensure_ascii=False),
+            content_type="application/json")
+
+    blob_name = f"{stem}.wav"
     blob = bucket.blob(blob_name)
-    
+
     # ARCHITECTURAL FIX: 5MB Chunks and Tuple Timeout for Sleep-Mode Resilience
-    blob.chunk_size = 5 * 1024 * 1024 
+    blob.chunk_size = 5 * 1024 * 1024
     logging.info(f"Uploading to gs://{BUCKET_NAME}/{blob_name}...")
-    blob.upload_from_filename(file_path, timeout=(10, 120))
+    try:
+        blob.upload_from_filename(file_path, timeout=(10, 120))
+    except Exception:
+        if companion_blob is not None:
+            try:
+                companion_blob.delete()  # best-effort orphan cleanup
+            except Exception:
+                pass
+        raise
     logging.info("Upload successful.")
 
 def show_mic_warning():
@@ -287,9 +486,31 @@ def recording_thread_task(status_label, start_btn, end_btn):
 
         logging.info(f"Writing audio to safe backup vault: {safe_file_path}")
         wavfile.write(safe_file_path, TARGET_SAMPLE_RATE, output_audio)
-        
+
+        # Local speaker diarization (Phase 9) -- runs on the already-in-memory,
+        # already-padded channels, so segment timestamps align sample-for-sample
+        # with the .wav just written. CPU-only, no GCP cost; ~30s for a 45-minute
+        # meeting is the expected order of magnitude.
+        diar_payload = None
+        if DIARIZATION_ENABLED:
+            root_window.after(0, lambda: status_label.config(text="Status: Analyzing speakers..."))
+            diar_payload = build_diarization_payload(
+                mic_array, sys_array, bool(default_loopback),
+                duration_sec=len(mic_array) / TARGET_SAMPLE_RATE)
+            if diar_payload:
+                # Permanent local copy, alongside the audio backup -- unlike the
+                # audio itself, NOT subject to the 7-day clean_old_backups() sweep;
+                # these files are tiny and the user wants them kept longer.
+                diar_backup_path = safe_file_path.replace(".wav", ".diarization.json")
+                try:
+                    with open(diar_backup_path, "w", encoding="utf-8") as f:
+                        json.dump(diar_payload, f, ensure_ascii=False)
+                except Exception:
+                    logging.exception("Could not write local diarization backup copy (non-fatal):")
+
         # Attempt Upload
-        upload_to_gcp(safe_file_path)
+        root_window.after(0, lambda: status_label.config(text="Status: Uploading..."))
+        upload_to_gcp(safe_file_path, diar_payload)
         
         # ARCHITECTURAL FIX: Do NOT delete the file! Keep it for 7 days.
         logging.info("Upload complete. Audio retained in Tamlelan_Backups for 7 days.")

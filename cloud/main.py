@@ -23,6 +23,115 @@ def is_grounded(source_quote, transcript, threshold=GROUNDING_THRESHOLD):
         return True
     return fuzz.partial_ratio(source_quote, transcript) >= threshold
 
+
+MAX_PROMPT_SEGMENTS = 2000
+DIARIZATION_SCHEMA_VERSION = 1
+
+
+def companion_name_for(wav_name):
+    if not wav_name.endswith(".wav"):
+        return None
+    return wav_name[:-4] + ".diarization.json"
+
+
+def load_diarization(bucket, file_name):
+    """
+    Downloads and parses the companion diarization file for file_name, if one
+    exists. Returns a validated dict, or None on ANY failure (missing file, bad
+    JSON, wrong schema version, malformed segments) -- this function must never
+    raise. That is the entire graceful-degradation contract for clients that
+    don't produce a companion file (feature disabled, older client, or the
+    client-side diarization step itself failed).
+    """
+    try:
+        companion_name = companion_name_for(file_name)
+        if not companion_name:
+            return None
+        companion_blob = bucket.blob(companion_name)
+        if not companion_blob.exists():
+            return None
+        raw = companion_blob.download_as_bytes()
+        diar = json.loads(raw)
+        if not isinstance(diar, dict):
+            return None
+        if diar.get("schema_version") != DIARIZATION_SCHEMA_VERSION:
+            return None
+        if not isinstance(diar.get("segments"), list):
+            return None
+        if diar.get("channel_mode") not in ("stereo_operator_left", "mono_single_track"):
+            return None
+        return diar
+    except Exception as e:
+        print(f"[WARNING] Could not load diarization companion for {file_name}: {e}")
+        return None
+
+
+def _format_mmss(seconds):
+    seconds = max(0, int(seconds))
+    return f"{seconds // 60}:{seconds % 60:02d}"
+
+
+def format_diarization_for_prompt(diar):
+    """
+    Returns "" when diar is None (graceful degradation -- both prompts are then
+    byte-identical to their pre-diarization form). Otherwise returns a prompt
+    block describing the speaker roster and turn boundaries as local, structural
+    ground truth for Gemini to resolve real names against.
+    """
+    if not diar:
+        return ""
+
+    segments = sorted(diar.get("segments") or [], key=lambda s: s[0] if len(s) > 0 else 0)
+    speaker_count = diar.get("speaker_count") or len({s[2] for s in segments if len(s) > 2})
+    channel_mode = diar.get("channel_mode")
+
+    if channel_mode == "stereo_operator_left":
+        channel_note = (
+            "The audio is stereo. OPERATOR is the left channel (the person running the "
+            "recording). Other labels are distinct voices separated out of the right "
+            "channel (remote participants)."
+        )
+    else:
+        channel_note = (
+            "The audio is mono (a single in-room microphone). The labels below are "
+            "distinct voices in the room; one of them is the operator, but which one is "
+            "not known from the audio channel alone -- determine it from context."
+        )
+
+    lines = [
+        "SPEAKER TURN DATA (ground truth, computed locally from the audio waveform --",
+        "this is structural evidence, not a guess):",
+        "",
+        f"This recording contains {speaker_count} distinct speaking voices.",
+        channel_note,
+        "",
+    ]
+
+    if len(segments) > MAX_PROMPT_SEGMENTS:
+        lines.append(
+            f"(Turn-by-turn list omitted -- {len(segments)} segments exceeds the prompt "
+            f"limit. Use the speaker count and channel information above.)"
+        )
+    else:
+        lines.append("Speaking turns (start-end, label):")
+        for seg in segments:
+            if len(seg) < 3:
+                continue
+            start, end, label = seg[0], seg[1], seg[2]
+            lines.append(f"{_format_mmss(start)}-{_format_mmss(end)} {label}")
+
+    lines.append("")
+    lines.append(
+        "Use these turn boundaries as authoritative for WHEN the speaker changes and for "
+        "HOW MANY distinct people speak. The labels are anonymous -- resolve each one to a "
+        "real name yourself from the audio (e.g. when someone introduces themselves) and "
+        "use the real name in your output. If you cannot resolve a label to a real name, "
+        "keep the anonymous label."
+    )
+
+    return "\n\n" + "\n".join(lines)
+
+
 @functions_framework.cloud_event
 def tamlelan_handler(cloud_event):
     event_id = cloud_event["id"]
@@ -53,6 +162,11 @@ def tamlelan_handler(cloud_event):
 
     try:
         blob.download_to_filename(local_audio_path)
+
+        diar = load_diarization(bucket, file_name)
+        diar_block = format_diarization_for_prompt(diar)
+        if diar:
+            print(f"[Step 1b] Diarization companion loaded: {diar.get('speaker_count')} speakers, {diar.get('channel_mode')}.")
 
         api_key = os.environ.get("GEMINI_API_KEY")
         client = genai.Client(api_key=api_key)
@@ -211,7 +325,7 @@ def tamlelan_handler(cloud_event):
         
         summary_response = client.models.generate_content(
             model='gemini-3.1-pro-preview',
-            contents=[summary_prompt, gemini_file],
+            contents=[summary_prompt + diar_block, gemini_file],
             config=types.GenerateContentConfig(
                 response_mime_type="application/json", 
                 response_schema=schema,
@@ -265,7 +379,7 @@ def tamlelan_handler(cloud_event):
         
         transcript_response = client.models.generate_content(
             model='gemini-3.1-pro-preview',
-            contents=[transcript_prompt, gemini_file],
+            contents=[transcript_prompt + diar_block, gemini_file],
             config=types.GenerateContentConfig(
                 response_mime_type="text/plain",
                 temperature=0.1
@@ -307,6 +421,16 @@ def tamlelan_handler(cloud_event):
                 topic_ref_ok = (topic_ref is None) or (topic_ref in known_topic_ids)
                 item['_grounded'] = quote_ok and topic_ref_ok
 
+        # Attendee cross-check against the local diarization companion, if one was
+        # loaded: a deterministic backstop for the attendees-over-inclusion defect --
+        # if diarization detected N distinct voices and Gemini lists more than N+1
+        # attendees, something is wrong. Flag, don't drop -- same philosophy as the
+        # grounding checks above. The +1 tolerance absorbs diarization merging two
+        # similar-sounding voices into one cluster.
+        attendee_count_ok = True
+        if diar and isinstance(diar.get('speaker_count'), int) and diar['speaker_count'] > 0:
+            attendee_count_ok = len(res_data.get('attendees') or []) <= diar['speaker_count'] + 1
+
         print("[Step 4c] Grounding verification complete.")
 
         # ==========================================
@@ -332,7 +456,8 @@ def tamlelan_handler(cloud_event):
         md_summary = f"<div dir='rtl'>\n# סיכום פגישה\n\n"
         md_summary += f"## תקציר מנהלים\n{executive_summary}\n\n"
 
-        md_summary += "## משתתפים\n"
+        attendee_warn = " ⚠ _(מספר המשתתפים אינו תואם למספר הקולות שזוהו בהקלטה)_" if not attendee_count_ok else ""
+        md_summary += f"## משתתפים{attendee_warn}\n"
         if not attendees: md_summary += "* לא זוהו משתתפים\n"
         else:
             for a in attendees:
@@ -476,6 +601,18 @@ def tamlelan_handler(cloud_event):
                     blob.delete()
         except Exception as cleanup_err:
             print(f"[WARNING] Cleanup could not preserve/delete source blob: {cleanup_err}")
+        try:
+            companion_name = companion_name_for(file_name)
+            if companion_name:
+                companion_blob = bucket.blob(companion_name)
+                if companion_blob.exists():
+                    if succeeded:
+                        companion_blob.delete()
+                    else:
+                        bucket.blob(f"failed/{companion_name}").upload_from_string(companion_blob.download_as_bytes())
+                        companion_blob.delete()
+        except Exception as cleanup_err:
+            print(f"[WARNING] Cleanup could not preserve/delete diarization companion: {cleanup_err}")
         try:
             if gemini_file and client: client.files.delete(name=gemini_file.name)
         except Exception: pass

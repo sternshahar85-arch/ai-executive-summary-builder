@@ -15,6 +15,9 @@ scribe.spec
 .venv-cloud/
 .venv-pipeline/
 
+# Diarization ONNX models -- downloaded on first run, not source (~35MB)
+models/
+
 # Runtime data / logs / backups
 Tamlelan_Backups/
 *.log

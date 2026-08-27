@@ -5,3 +5,6 @@ scipy==1.18.0
 google-cloud-storage==3.13.1
 google-auth==2.56.3
 PyAudioWPatch==0.2.12.8
+# Local speaker diarization (Phase 9) -- CPU-only, free/open-source. Confirmed
+# to ship an official win_amd64 wheel for this machine's Python (3.14).
+sherpa-onnx==1.13.6
