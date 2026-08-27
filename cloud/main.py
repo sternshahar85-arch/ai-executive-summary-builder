@@ -233,8 +233,34 @@ def tamlelan_handler(cloud_event):
         # ==========================================
         print("[Step 3b] Running AI Analysis (Pass 2: Full Transcript)...")
         transcript_prompt = """
-        Please provide a highly accurate, full verbatim transcript of this entire meeting audio. 
-        Ensure all text is in fluent Hebrew. Do not summarize. Output ONLY the raw transcript text.
+        Please provide a highly accurate, full verbatim transcript of this entire meeting
+        audio. Ensure all text is in fluent Hebrew. Do not summarize.
+
+        If the audio is stereo: the LEFT channel is the meeting operator (the person
+        running the recording), and the RIGHT channel is remote/system audio (other
+        participants on the call). Use this to distinguish who is speaking -- the right
+        channel may itself contain multiple remote speakers mixed together, so treat it
+        as "not the operator" rather than a single identified person unless a name is
+        stated. If the audio is mono, no such channel distinction exists.
+
+        Label every line with the speaker. Use this exact line format:
+
+          M:SS [SPEAKER]: <what was said>
+
+        Rules for SPEAKER:
+        - If a person's real name is established anywhere in the audio (they introduce
+          themselves, or someone addresses them by name), use that real name on EVERY
+          line they speak -- including lines earlier in the meeting, before the name was
+          said.
+        - If you cannot establish a real name, use a stable generic label: "דובר 1",
+          "דובר 2", ... Reuse the same generic label for the same voice throughout.
+          Never renumber mid-meeting.
+        - NEVER invent or guess a name. A name mentioned in conversation does not mean
+          that person is speaking.
+        - For non-speech stretches use "M:SS - M:SS: [שקט]" with no speaker label.
+
+        Start a new line whenever the speaker changes. Output ONLY the raw transcript
+        text -- no preamble, no headings, no commentary.
         """
         
         transcript_response = client.models.generate_content(
