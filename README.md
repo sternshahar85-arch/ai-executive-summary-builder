@@ -1,4 +1,4 @@
-# Project Tamlelan
+# AI Executive Summary Builder
 
 **Document Type:** Architecture & Current State
 **As of:** commit `48f4a0d`, 2026-08-27
