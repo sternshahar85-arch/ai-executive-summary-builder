@@ -143,4 +143,12 @@ def render_table(records):
         lines.append("")
         lines.append(f"*{excluded} meeting(s) excluded from $ totals (missing/failed usage data).*")
 
+    lines.append("")
+    lines.append(
+        "*$ figures are estimated from Gemini's self-reported token counts, which this "
+        "project found to be unreliable on the input side for this model under explicit "
+        "caching (see metrics/config.py) -- treat as directional, and periodically "
+        "cross-check against Cloud Billing -> Reports (Group by: SKU).*"
+    )
+
     return "\n".join(lines)

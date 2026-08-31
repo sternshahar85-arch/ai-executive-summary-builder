@@ -16,6 +16,24 @@ GEMINI_PRICING = {
     "output_per_million": 12.00,
 }
 
+# KNOWN LIMITATION, verified 2026-08-31: the input-token half of cost_for()'s
+# math (prompt_tokens/cached_tokens from Gemini's own usage_metadata) does not
+# appear to be reliable for gemini-3.1-pro-preview under explicit caching --
+# a real call reporting cached_content_token_count=107,326 reported
+# prompt_token_count=85,363, smaller than the cache, which the documented
+# semantics (prompt_token_count includes cached tokens as a subset) says
+# shouldn't be possible. Directly measuring the real prompt text with
+# count_tokens() showed the true new content was ~876 tokens; real GCP
+# billing for the entire "text input" SKU across four months was ₪0.25 --
+# nowhere near what a single call's prompt_token_count implied. This matches
+# a known class of problem elsewhere too (see comet-ml/opik issue #6976,
+# googleapis/python-genai issue #2064) -- not something specific to this
+# codebase, and not something to silently trust. The OUTPUT-token numbers
+# are unaffected by this (independently verified, and matched by real
+# billing) -- only the input-side dollar estimate below is in question.
+# Treat cost_for()'s output as directional, not precise, and cross-check
+# periodically against Cloud Billing -> Reports (Group by: SKU).
+
 # Maps a minimum speaker_count to a bucket name. A record's bucket is the
 # highest threshold its speaker_count meets or exceeds. speaker_count of 0/1,
 # or missing (no diarization companion), falls through to "unknown" rather

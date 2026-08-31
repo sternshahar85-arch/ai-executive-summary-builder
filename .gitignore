@@ -25,3 +25,8 @@ Tamlelan_Backups/
 # Audio recordings — real meeting content, not source
 *.wav
 !debug_audio.wav
+
+# Ad-hoc investigation/validation scripts -- exploratory tools with hardcoded
+# local paths, not production source. May contain a fetched copy of the
+# Gemini API key (gk.txt) when in use -- never commit.
+_investigation_scripts/
