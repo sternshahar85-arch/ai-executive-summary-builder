@@ -168,7 +168,9 @@ def run_handler(bucket, summary_fixture, event_id="evt-1", file_name="meeting.wa
     pass1_prompt = fake_client.models.generate_content.call_args_list[0].kwargs["contents"][0]
     pass2_prompt = fake_client.models.generate_content.call_args_list[1].kwargs["contents"][0]
     summary_md = next((v for k, v in sent_docs.items() if k.startswith("Summary_")), None)
-    return result, pass1_prompt, pass2_prompt, summary_md, bucket
+    cache_contents = fake_client.caches.create.call_args.kwargs["config"].contents \
+        if fake_client.caches.create.call_args else []
+    return result, pass1_prompt, pass2_prompt, summary_md, bucket, cache_contents
 
 
 class TestFormatDiarizationForPrompt(unittest.TestCase):
@@ -239,14 +241,22 @@ class TestEndToEndGracefulDegradation(unittest.TestCase):
     def test_with_companion_both_prompts_get_speaker_data(self):
         bucket = FakeBucket()
         bucket.seed_companion("meeting.wav", STEREO_DIAR)
-        result, p1, p2, md, _ = run_handler(bucket, base_summary_fixture(2), "evt-diar-1")
+        result, p1, p2, md, _, cache_contents = run_handler(bucket, base_summary_fixture(2), "evt-diar-1")
         self.assertEqual(result, ("Success", 200))
-        self.assertIn("SPEAKER TURN DATA", p1)
-        self.assertIn("SPEAKER TURN DATA", p2)
+        # Pass 1/2 prompts no longer carry the diarization block directly -- it's
+        # cached alongside the audio instead (Root Cause A fix), so both prompts
+        # are now just their own instruction text.
+        self.assertNotIn("SPEAKER TURN DATA", p1)
+        self.assertNotIn("SPEAKER TURN DATA", p2)
+        # The diarization block must be present in what actually got cached.
+        self.assertTrue(
+            any("SPEAKER TURN DATA" in c for c in cache_contents if isinstance(c, str)),
+            "Expected the diarization block in the cached content, not the per-pass prompt",
+        )
 
     def test_without_companion_neither_prompt_mentions_speaker_data(self):
         bucket = FakeBucket()  # no companion seeded
-        result, p1, p2, md, _ = run_handler(bucket, base_summary_fixture(2), "evt-diar-2")
+        result, p1, p2, md, _, _ = run_handler(bucket, base_summary_fixture(2), "evt-diar-2")
         self.assertEqual(result, ("Success", 200))
         self.assertNotIn("SPEAKER TURN DATA", p1)
         self.assertNotIn("SPEAKER TURN DATA", p2)
@@ -256,20 +266,20 @@ class TestAttendeeCrossCheck(unittest.TestCase):
     def test_mismatch_flagged(self):
         bucket = FakeBucket()
         bucket.seed_companion("meeting.wav", STEREO_DIAR)  # speaker_count=3
-        _, _, _, md, _ = run_handler(bucket, base_summary_fixture(16), "evt-mismatch-1")
+        _, _, _, md, _, _ = run_handler(bucket, base_summary_fixture(16), "evt-mismatch-1")
         header_line = next(line for line in md.split("\n") if "משתתפים" in line and line.startswith("##"))
         self.assertIn("⚠", header_line)
 
     def test_match_not_flagged(self):
         bucket = FakeBucket()
         bucket.seed_companion("meeting.wav", STEREO_DIAR)  # speaker_count=3
-        _, _, _, md, _ = run_handler(bucket, base_summary_fixture(2), "evt-mismatch-2")
+        _, _, _, md, _, _ = run_handler(bucket, base_summary_fixture(2), "evt-mismatch-2")
         header_line = next(line for line in md.split("\n") if "משתתפים" in line and line.startswith("##"))
         self.assertNotIn("⚠", header_line)
 
     def test_no_companion_never_flags(self):
         bucket = FakeBucket()
-        _, _, _, md, _ = run_handler(bucket, base_summary_fixture(16), "evt-mismatch-3")
+        _, _, _, md, _, _ = run_handler(bucket, base_summary_fixture(16), "evt-mismatch-3")
         header_line = next(line for line in md.split("\n") if "משתתפים" in line and line.startswith("##"))
         self.assertNotIn("⚠", header_line)
 

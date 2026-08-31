@@ -1,6 +1,7 @@
 import os
 import json
 import time
+import wave
 import urllib.request
 import functions_framework
 from google import genai
@@ -174,9 +175,22 @@ def tamlelan_handler(cloud_event):
     gemini_file = None
     cache = None
     succeeded = False
+    duration_sec = None
+    diar = None
+    summary_response = None
+    transcript_response = None
+    diagram_needed = False
+    pipeline_error = None
+    started_at = time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())
 
     try:
         blob.download_to_filename(local_audio_path)
+
+        try:
+            with wave.open(local_audio_path, 'rb') as wf:
+                duration_sec = wf.getnframes() / float(wf.getframerate())
+        except Exception as dur_err:
+            print(f"[WARNING] Could not read audio duration from WAV header: {dur_err}")
 
         diar = load_diarization(bucket, file_name)
         diar_block = format_diarization_for_prompt(diar)
@@ -193,17 +207,24 @@ def tamlelan_handler(cloud_event):
             time.sleep(2)
             gemini_file = client.files.get(name=gemini_file.name)
 
-        # Explicit context cache: the audio is sent to Gemini twice (Pass 1 + Pass 2)
-        # below, so caching it once here means Pass 2 reads it back at ~10% of the
-        # input-token price instead of paying full price again. Falls back to the
-        # uncached path on any failure (e.g. audio too short to meet the cache's
-        # minimum token count) -- this must never be able to break the pipeline.
+        # Explicit context cache: the audio AND the diarization block are sent to
+        # Gemini twice (Pass 1 + Pass 2) below, so caching them once here means
+        # Pass 2 reads them back at ~10% of the input-token price instead of paying
+        # full price again. For a large/complex meeting the diarization turn-by-turn
+        # block can itself be tens of thousands of tokens, so it's cached alongside
+        # the audio, not left as fresh per-pass text. Falls back to the uncached path
+        # on any failure (e.g. audio too short to meet the cache's minimum token
+        # count) -- this must never be able to break the pipeline.
+        cache_contents = [gemini_file]
+        if diar_block:
+            cache_contents.append(diar_block)
+
         cache = None
         try:
             cache = client.caches.create(
                 model='gemini-3.1-pro-preview',
                 config=types.CreateCachedContentConfig(
-                    contents=[gemini_file],
+                    contents=cache_contents,
                     ttl="600s",
                 )
             )
@@ -359,7 +380,7 @@ def tamlelan_handler(cloud_event):
         
         summary_response = client.models.generate_content(
             model='gemini-3.1-pro-preview',
-            contents=[summary_prompt + diar_block] + ([] if cache else [gemini_file]),
+            contents=[summary_prompt] if cache else [summary_prompt + diar_block, gemini_file],
             config=types.GenerateContentConfig(
                 response_mime_type="application/json",
                 response_schema=schema,
@@ -373,6 +394,7 @@ def tamlelan_handler(cloud_event):
         
         try:
             res_data = json.loads(raw_text)
+            diagram_needed = bool(res_data.get('diagram_needed'))
             print(f"[Step 4a] Summary Analysis complete and JSON parsed successfully.")
         except json.JSONDecodeError as e:
             print(f"[CRITICAL ERROR] JSON Parsing failed: {e}")
@@ -415,7 +437,7 @@ def tamlelan_handler(cloud_event):
         
         transcript_response = client.models.generate_content(
             model='gemini-3.1-pro-preview',
-            contents=[transcript_prompt + diar_block] + ([] if cache else [gemini_file]),
+            contents=[transcript_prompt] if cache else [transcript_prompt + diar_block, gemini_file],
             config=types.GenerateContentConfig(
                 response_mime_type="text/plain",
                 temperature=0.1,
@@ -625,6 +647,7 @@ def tamlelan_handler(cloud_event):
 
     except Exception as e:
         print(f"[CRITICAL ERROR] Pipeline failed: {e}")
+        pipeline_error = str(e)[:500]
         raise e
 
     finally:
@@ -660,6 +683,49 @@ def tamlelan_handler(cloud_event):
         try:
             if os.path.exists(local_audio_path): os.remove(local_audio_path)
         except Exception: pass
+        try:
+            def _safe_num(v):
+                return v if isinstance(v, (int, float)) and not isinstance(v, bool) else None
+
+            def _usage_dict(resp):
+                u = getattr(resp, "usage_metadata", None) if resp is not None else None
+                if u is None:
+                    return None
+                return {
+                    "prompt_tokens": _safe_num(getattr(u, "prompt_token_count", None)),
+                    "cached_tokens": _safe_num(getattr(u, "cached_content_token_count", None)),
+                    "output_tokens": _safe_num(getattr(u, "candidates_token_count", None)),
+                    "total_tokens": _safe_num(getattr(u, "total_token_count", None)),
+                }
+
+            cache_write_tokens = None
+            if cache is not None:
+                cache_write_tokens = _safe_num(getattr(getattr(cache, "usage_metadata", None), "total_token_count", None))
+
+            metrics_record = {
+                "schema_version": 1,
+                "event_id": event_id,
+                "file_stem": os.path.basename(file_name)[:-4] if file_name.endswith(".wav") else os.path.basename(file_name),
+                "started_at": started_at,
+                "finished_at": time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime()),
+                "success": succeeded,
+                "error": pipeline_error,
+                "duration_sec": _safe_num(duration_sec),
+                "speaker_count": diar.get("speaker_count") if diar else None,
+                "channel_mode": diar.get("channel_mode") if diar else None,
+                "cache_used": cache is not None,
+                "cache_write_tokens": cache_write_tokens,
+                "diagram_generated": diagram_needed,
+                "usage": {
+                    "pass1_summary": _usage_dict(summary_response),
+                    "pass2_transcript": _usage_dict(transcript_response),
+                },
+            }
+            safe_event_id = str(event_id).replace("/", "_")
+            bucket.blob(f"metrics/{safe_event_id}.json").upload_from_string(
+                json.dumps(metrics_record, ensure_ascii=False), content_type="application/json")
+        except Exception as metrics_err:
+            print(f"[WARNING] Could not write metrics record: {metrics_err}")
         print("--- PIPELINE FINISHED ---")
 
     return "Success", 200
