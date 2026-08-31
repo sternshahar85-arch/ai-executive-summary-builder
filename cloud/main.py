@@ -441,7 +441,14 @@ def tamlelan_handler(cloud_event):
             config=types.GenerateContentConfig(
                 response_mime_type="text/plain",
                 temperature=0.1,
-                cached_content=cache.name if cache else None
+                cached_content=cache.name if cache else None,
+                # Default thinking was observed burning ~63K tokens (42% of the
+                # total budget) on this pass, leaving too little for the actual
+                # transcript and truncating real meetings mid-way
+                # (finish_reason=MAX_TOKENS). thinking_level="LOW" completes the
+                # full transcript using fewer total tokens. Verified 2026-08-31
+                # against a real 54-min/8-speaker meeting recording.
+                thinking_config=types.ThinkingConfig(thinking_level="LOW")
             )
         )
         log_token_usage("Pass 2 (transcript)", transcript_response)
