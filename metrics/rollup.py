@@ -10,7 +10,10 @@ import os
 import sys
 
 sys.path.insert(0, os.path.dirname(__file__))
-from config import GEMINI_PRICING, SHAPE_BUCKET_EDGES, BUCKET_ORDER, BUCKET_LABELS, TRAILING_WINDOW_DAYS
+from config import (
+    GEMINI_PRICING, GEMINI_FLASH_LITE_PRICING, SHAPE_BUCKET_EDGES, BUCKET_ORDER,
+    BUCKET_LABELS, TRAILING_WINDOW_DAYS,
+)
 
 
 def load_records(path):
@@ -84,6 +87,14 @@ def cost_for(record):
 
     if record.get("cache_used") and isinstance(record.get("cache_write_tokens"), (int, float)):
         total += record["cache_write_tokens"] * GEMINI_PRICING["cache_write_per_million"] / 1_000_000
+
+    diagram = usage.get("diagram_generation")
+    if record.get("diagram_generated") and isinstance(diagram, dict):
+        d_prompt = diagram.get("prompt_tokens")
+        d_output = diagram.get("output_tokens")
+        if isinstance(d_prompt, (int, float)) and isinstance(d_output, (int, float)):
+            total += d_prompt * GEMINI_FLASH_LITE_PRICING["input_standard_per_million"] / 1_000_000
+            total += d_output * GEMINI_FLASH_LITE_PRICING["output_per_million"] / 1_000_000
 
     return total
 

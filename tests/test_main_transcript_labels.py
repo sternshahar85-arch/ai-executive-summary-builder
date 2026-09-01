@@ -31,6 +31,11 @@ class FakeBlob:
         self.bucket = bucket
         self.path = path
         self.deleted = False
+        self.crc32c = None
+        self.md5_hash = None
+
+    def reload(self):
+        pass
 
     def exists(self):
         return not self.deleted

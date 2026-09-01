@@ -180,25 +180,42 @@ def merge_speaker_segments(segments, gap=DIAR_MERGE_GAP_SEC):
     return [tuple(m) for m in merged]
 
 
-def build_diarization_payload(mic_array, sys_array, has_loopback, duration_sec, expected_participants=None):
+def build_diarization_payload(mic_array, sys_array, has_loopback, duration_sec,
+                               room_participants=None, remote_participants=None):
     """
     Channel-selection logic:
     - Stereo (has_loopback=True, e.g. a 3+-person Zoom call): diarize the RIGHT
       (system/remote) channel to separate multiple remote voices -- Zoom already
       mixed them down before this ever saw the audio, and nothing else
-      distinguishes them. Diarize the LEFT (mic) channel with num_clusters=1 for
-      a free operator speech-activity timeline via the same code path.
+      distinguishes them. The LEFT (mic) channel is diarized too, not just
+      relabeled -- see room_participants below.
     - Mono (has_loopback=False, in-room case): diarize the full mono track --
       no privileged "operator" identity, since there's no channel signal at all.
 
-    expected_participants (optional, total headcount including the operator):
-    real-world testing showed automatic clustering (num_clusters=-1) badly
-    over-segments real Zoom audio -- a 2-remote-person meeting produced 16+
-    distinct spurious labels, mostly from short utterances/background noise.
-    Supplying the true count (sherpa-onnx's own docs recommend this) fixes the
-    cluster count directly instead of leaving it to a similarity threshold that
-    real, noisy audio doesn't cleanly meet. When not supplied, falls back to
-    automatic detection exactly as before.
+    room_participants (optional): how many distinct people share the recording
+    device's own mic/room channel. Real-world testing found this channel was
+    previously hardcoded to exactly one speaker ("OPERATOR") regardless of
+    actual content -- correct for a dedicated headset, but wrong for a laptop
+    sitting on a table in a hybrid meeting, where multiple physical people
+    speak into that same shared channel and were being silently merged into
+    one identity. When room_participants >= 2, this channel now gets the same
+    real clustering (segmentation + speaker embeddings) already used for the
+    remote/mono paths, labeled "ROOM_NN". When None/0/1 (the common single-
+    headset case), falls back to the original zero-cost single-"OPERATOR"
+    fast path -- no clustering compute spent, byte-identical to before.
+    In mono mode (no loopback channel at all), this is the only participant
+    count that applies -- it's the full-track headcount, same role the old
+    single expected_participants field played for mono.
+
+    remote_participants (optional, stereo only): how many distinct people are
+    on the remote/system-audio side. Real-world testing showed automatic
+    clustering (num_clusters=-1) badly over-segments real Zoom audio -- a
+    2-remote-person meeting produced 16+ distinct spurious labels, mostly from
+    short utterances/background noise. Supplying the true count (sherpa-onnx's
+    own docs recommend this) fixes the cluster count directly instead of
+    leaving it to a similarity threshold that real, noisy audio doesn't
+    cleanly meet. When not supplied (None/0), falls back to automatic
+    detection exactly as before.
 
     Returns None on ANY failure. Diarization must never cost the user a recording.
     """
@@ -206,28 +223,30 @@ def build_diarization_payload(mic_array, sys_array, has_loopback, duration_sec, 
         return None
     try:
         if has_loopback:
-            remote_num_clusters = -1
-            if expected_participants and expected_participants >= 2:
-                remote_num_clusters = expected_participants - 1
+            remote_num_clusters = remote_participants if (remote_participants and remote_participants >= 1) else -1
 
-            # num_clusters=1 guarantees exactly one distinct label on this channel
-            # by construction -- relabel uniformly to plain "OPERATOR" rather than
-            # trusting diarize_channel's f"{prefix}{speaker:02d}" formatting (which
-            # would produce "OPERATOR00"), since the channel/label equality check
-            # below depends on the exact string "OPERATOR".
-            operator_segments = [(s, e, "OPERATOR") for s, e, _ in
-                                  diarize_channel(mic_array, "OPERATOR", num_clusters=1)]
+            if room_participants and room_participants >= 2:
+                operator_segments = merge_speaker_segments(
+                    diarize_channel(mic_array, "ROOM_", num_clusters=room_participants))
+            else:
+                # num_clusters=1 guarantees exactly one distinct label on this
+                # channel by construction -- relabel uniformly to plain
+                # "OPERATOR" rather than trusting diarize_channel's
+                # f"{prefix}{speaker:02d}" formatting (which would produce
+                # "OPERATOR00").
+                operator_segments = [(s, e, "OPERATOR") for s, e, _ in
+                                      diarize_channel(mic_array, "OPERATOR", num_clusters=1)]
             remote_segments = diarize_channel(sys_array, "REMOTE_", num_clusters=remote_num_clusters)
             all_segments = merge_speaker_segments(operator_segments + remote_segments)
             labels = {seg[2] for seg in all_segments}
             speaker_count = len(labels)
             speakers = [
-                {"label": lbl, "channel": "left" if lbl == "OPERATOR" else "right"}
+                {"label": lbl, "channel": "left" if (lbl == "OPERATOR" or lbl.startswith("ROOM_")) else "right"}
                 for lbl in sorted(labels)
             ]
             channel_mode = "stereo_operator_left"
         else:
-            mono_num_clusters = expected_participants if (expected_participants and expected_participants >= 1) else -1
+            mono_num_clusters = room_participants if (room_participants and room_participants >= 1) else -1
             mono_segments = merge_speaker_segments(diarize_channel(mic_array, "SPEAKER_", num_clusters=mono_num_clusters))
             all_segments = mono_segments
             labels = {seg[2] for seg in all_segments}
@@ -240,7 +259,8 @@ def build_diarization_payload(mic_array, sys_array, has_loopback, duration_sec, 
             "channel_mode": channel_mode,
             "sample_rate": TARGET_SAMPLE_RATE,
             "duration_sec": duration_sec,
-            "expected_participants": expected_participants,
+            "room_participants": room_participants,
+            "remote_participants": remote_participants,
             "speaker_count": speaker_count,
             "speakers": speakers,
             "segments": [[round(s, 2), round(e, 2), lbl] for s, e, lbl in sorted(all_segments)],
@@ -354,7 +374,7 @@ def update_meter_ui(vol_canvas, vol_bar):
     else:
         vol_canvas.coords(vol_bar, 0, 0, 0, 20)
 
-def recording_thread_task(status_label, start_btn, end_btn, expected_participants=None):
+def recording_thread_task(status_label, start_btn, end_btn, room_participants=None, remote_participants=None):
     global is_recording, mic_frames, sys_frames, current_mic_rms, current_sys_rms
     
     mic_frames = []
@@ -512,7 +532,8 @@ def recording_thread_task(status_label, start_btn, end_btn, expected_participant
             diar_payload = build_diarization_payload(
                 mic_array, sys_array, bool(default_loopback),
                 duration_sec=len(mic_array) / TARGET_SAMPLE_RATE,
-                expected_participants=expected_participants)
+                room_participants=room_participants,
+                remote_participants=remote_participants)
             if diar_payload:
                 # Permanent local copy, alongside the audio backup -- unlike the
                 # audio itself, NOT subject to the 7-day clean_old_backups() sweep;
@@ -542,27 +563,32 @@ def recording_thread_task(status_label, start_btn, end_btn, expected_participant
         root_window.after(0, lambda: start_btn.config(state=tk.NORMAL))
         root_window.after(0, lambda: end_btn.config(state=tk.DISABLED))
 
-def start_recording(status_label, start_btn, end_btn, vol_canvas, vol_bar, participants_var=None):
+def _parse_participants_var(var):
+    """Reads a Tk IntVar/StringVar-like participants field; None on missing/blank/invalid."""
+    if var is None:
+        return None
+    try:
+        value = int(var.get())
+        return value if value >= 1 else None
+    except (ValueError, tk.TclError):
+        return None  # left blank or invalid -- falls back to automatic detection
+
+def start_recording(status_label, start_btn, end_btn, vol_canvas, vol_bar,
+                     room_participants_var=None, remote_participants_var=None):
     global is_recording
     is_recording = True
     status_label.config(text="Status: Recording... (Mic + System)")
     start_btn.config(state=tk.DISABLED)
     end_btn.config(state=tk.NORMAL)
 
-    expected_participants = None
-    if participants_var is not None:
-        try:
-            value = int(participants_var.get())
-            if value >= 1:
-                expected_participants = value
-        except (ValueError, tk.TclError):
-            pass  # left blank or invalid -- falls back to automatic detection
+    room_participants = _parse_participants_var(room_participants_var)
+    remote_participants = _parse_participants_var(remote_participants_var)
 
     update_meter_ui(vol_canvas, vol_bar)
 
     threading.Thread(
         target=recording_thread_task,
-        args=(status_label, start_btn, end_btn, expected_participants),
+        args=(status_label, start_btn, end_btn, room_participants, remote_participants),
         daemon=True
     ).start()
 
@@ -595,15 +621,25 @@ def create_gui():
     vol_canvas.pack(side=tk.LEFT)
     vol_bar = vol_canvas.create_rectangle(0, 0, 0, 20, fill='limegreen')
 
-    participants_frame = tk.Frame(root_window)
-    participants_frame.pack(pady=5)
+    room_participants_frame = tk.Frame(root_window)
+    room_participants_frame.pack(pady=5)
 
-    participants_label = tk.Label(participants_frame, text="Participants (incl. you):", font=("Helvetica", 9))
-    participants_label.pack(side=tk.LEFT, padx=5)
+    room_participants_label = tk.Label(room_participants_frame, text="People in this room (incl. you):", font=("Helvetica", 9))
+    room_participants_label.pack(side=tk.LEFT, padx=5)
 
-    participants_var = tk.StringVar(value="2")
-    participants_spinbox = tk.Spinbox(participants_frame, from_=1, to=20, width=4, textvariable=participants_var)
-    participants_spinbox.pack(side=tk.LEFT)
+    room_participants_var = tk.StringVar(value="1")
+    room_participants_spinbox = tk.Spinbox(room_participants_frame, from_=1, to=20, width=4, textvariable=room_participants_var)
+    room_participants_spinbox.pack(side=tk.LEFT)
+
+    remote_participants_frame = tk.Frame(root_window)
+    remote_participants_frame.pack(pady=5)
+
+    remote_participants_label = tk.Label(remote_participants_frame, text="People joining remotely:", font=("Helvetica", 9))
+    remote_participants_label.pack(side=tk.LEFT, padx=5)
+
+    remote_participants_var = tk.StringVar(value="0")
+    remote_participants_spinbox = tk.Spinbox(remote_participants_frame, from_=0, to=20, width=4, textvariable=remote_participants_var)
+    remote_participants_spinbox.pack(side=tk.LEFT)
 
     btn_frame = tk.Frame(root_window)
     btn_frame.pack(pady=15)
@@ -611,7 +647,9 @@ def create_gui():
     start_btn = tk.Button(btn_frame, text="START", font=("Helvetica", 12), bg="green", fg="white", width=10)
     end_btn = tk.Button(btn_frame, text="END", font=("Helvetica", 12), bg="red", fg="white", width=10, state=tk.DISABLED)
 
-    start_btn.config(command=lambda: start_recording(status_label, start_btn, end_btn, vol_canvas, vol_bar, participants_var))
+    start_btn.config(command=lambda: start_recording(
+        status_label, start_btn, end_btn, vol_canvas, vol_bar,
+        room_participants_var, remote_participants_var))
     end_btn.config(command=lambda: stop_recording(status_label))
 
     start_btn.grid(row=0, column=0, padx=10)

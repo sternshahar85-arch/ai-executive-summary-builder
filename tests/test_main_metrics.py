@@ -52,6 +52,11 @@ class FakeBlob:
         self.deleted = False
         self._exists = False
         self._content = None
+        self.crc32c = None
+        self.md5_hash = None
+
+    def reload(self):
+        pass
 
     def exists(self):
         return self._exists and not self.deleted
@@ -206,6 +211,58 @@ class TestMetricsHappyPath(unittest.TestCase):
         self.assertEqual(record["usage"]["pass2_transcript"], {
             "prompt_tokens": 1000, "cached_tokens": 500, "output_tokens": 800, "total_tokens": 1800,
         })
+
+
+class TestMetricsDiagramGeneration(unittest.TestCase):
+    def test_diagram_usage_captured_when_diagram_generated(self):
+        bucket = FakeBucket()
+        bucket.seed_companion("meeting.wav", STEREO_DIAR)
+        client = make_fake_genai_client()
+
+        # diagram_needed=True this time, plus a third generate_content response
+        # for the flash-lite diagram call (client.models.generate_content is
+        # called Pass 1, Pass 2, then the diagram pass, in that order). Build
+        # fresh response mocks rather than mutating make_fake_genai_client()'s
+        # output -- once assigned, Mock.side_effect from a list becomes a
+        # non-subscriptable iterator, so the originals can't be read back.
+        summary_response = MagicMock()
+        summary_response.text = json.dumps({
+            "executive_summary": "Test summary", "attendees": [], "people_mentioned": [],
+            "key_topics": [], "decisions_log": [], "action_items": [],
+            "diagram_needed": True,
+        })
+        summary_response.usage_metadata = make_usage(1000, 500, 200, 1200)
+
+        transcript_response = MagicMock()
+        transcript_response.text = "Full transcript text."
+        transcript_response.usage_metadata = make_usage(1000, 500, 800, 1800)
+
+        diagram_response = MagicMock()
+        diagram_response.text = "<html><body>diagram</body></html>"
+        diagram_response.usage_metadata = make_usage(300, None, 150, 450)
+
+        client.models.generate_content.side_effect = [summary_response, transcript_response, diagram_response]
+
+        result = run_handler(bucket, client, "evt-metrics-diagram")
+
+        self.assertEqual(result, ("Success", 200))
+        record = bucket.metrics_record("evt-metrics-diagram")
+        self.assertIsNotNone(record)
+        self.assertTrue(record["diagram_generated"])
+        self.assertEqual(record["usage"]["diagram_generation"], {
+            "prompt_tokens": 300, "cached_tokens": None, "output_tokens": 150, "total_tokens": 450,
+        })
+
+    def test_diagram_usage_absent_when_no_diagram_generated(self):
+        bucket = FakeBucket()
+        bucket.seed_companion("meeting.wav", STEREO_DIAR)
+        client = make_fake_genai_client()  # diagram_needed=False by default
+        result = run_handler(bucket, client, "evt-metrics-nodiagram")
+
+        self.assertEqual(result, ("Success", 200))
+        record = bucket.metrics_record("evt-metrics-nodiagram")
+        self.assertFalse(record["diagram_generated"])
+        self.assertIsNone(record["usage"]["diagram_generation"])
 
 
 class TestMetricsCacheFallback(unittest.TestCase):

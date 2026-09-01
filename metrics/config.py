@@ -16,6 +16,18 @@ GEMINI_PRICING = {
     "output_per_million": 12.00,
 }
 
+GEMINI_FLASH_LITE_PRICING = {
+    # gemini-3.1-flash-lite, used only for the diagram-generation pass
+    # (cloud/main.py, no caching involved there -- no cache fields needed
+    # here). Pricing for this model was volatile at time of writing (2026-09):
+    # third-party trackers cited figures ranging $0.125-0.25/M input and
+    # $0.75-1.50/M output depending on source and date, not yet cross-checked
+    # against ai.google.dev/pricing directly. Re-verify before trusting this
+    # component's dollar output for anything beyond a rough estimate.
+    "input_standard_per_million": 0.25,
+    "output_per_million": 1.50,
+}
+
 # KNOWN LIMITATION, verified 2026-08-31: the input-token half of cost_for()'s
 # math (prompt_tokens/cached_tokens from Gemini's own usage_metadata) does not
 # appear to be reliable for gemini-3.1-pro-preview under explicit caching --

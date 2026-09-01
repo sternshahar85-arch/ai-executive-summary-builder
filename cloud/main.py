@@ -87,11 +87,28 @@ def format_diarization_for_prompt(diar):
     channel_mode = diar.get("channel_mode")
 
     if channel_mode == "stereo_operator_left":
-        channel_note = (
-            "The audio is stereo. OPERATOR is the left channel (the person running the "
-            "recording). Other labels are distinct voices separated out of the right "
-            "channel (remote participants)."
+        has_multi_room_speakers = any(
+            len(s) > 2 and str(s[2]).startswith("ROOM_") for s in segments
         )
+        if has_multi_room_speakers:
+            # room_participants >= 2 was supplied at recording time -- the left/
+            # room channel got real clustering instead of being forced to a
+            # single "OPERATOR" label, so multiple physical people may share it.
+            channel_note = (
+                "The audio is stereo. The left channel is the recording device's own "
+                "room microphone and captures more than one physical person -- labels "
+                "starting with ROOM_ are distinct voices on that channel, none "
+                "privileged as \"the operator\"; resolve each to a real name from "
+                "context the same way as any other label. Labels starting with "
+                "REMOTE_ are distinct voices separated out of the right channel "
+                "(remote participants)."
+            )
+        else:
+            channel_note = (
+                "The audio is stereo. OPERATOR is the left channel (the person running the "
+                "recording). Other labels are distinct voices separated out of the right "
+                "channel (remote participants)."
+            )
     else:
         channel_note = (
             "The audio is mono (a single in-room microphone). The labels below are "
@@ -179,11 +196,33 @@ def tamlelan_handler(cloud_event):
     diar = None
     summary_response = None
     transcript_response = None
+    flash_res = None
     diagram_needed = False
     pipeline_error = None
+    duplicate_of_event_id = None
     started_at = time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())
 
+    # Content-hash dedup guard: the locks/{event_id}.lock mechanism above only
+    # deduplicates retries of the SAME Eventarc event -- it does nothing for the
+    # same audio content arriving as two genuinely distinct GCS objects/events
+    # (e.g. a manual re-upload after a transient Gemini error). GCS already
+    # computes crc32c on upload, so this check costs nothing extra and needs no
+    # download. Uses the same atomic if_generation_match=0 pattern as the lock
+    # above, so it's race-safe under concurrent invocations too.
+    blob.reload()
+    content_key = blob.crc32c or blob.md5_hash
+
     try:
+        if content_key:
+            dup_marker_blob = bucket.blob(f"content_hashes/{content_key}.json")
+            if dup_marker_blob.exists():
+                prior = json.loads(dup_marker_blob.download_as_bytes())
+                duplicate_of_event_id = prior.get("event_id")
+                print(f"[Step 1c] Duplicate content detected (content_key={content_key}), "
+                      f"already successfully processed as event {duplicate_of_event_id}. Skipping pipeline.")
+                succeeded = True
+                return "Duplicate Content - Already Processed", 200
+
         blob.download_to_filename(local_audio_path)
 
         try:
@@ -645,6 +684,7 @@ def tamlelan_handler(cloud_event):
                 contents=flash_prompt,
                 config=types.GenerateContentConfig(temperature=0.1)
             )
+            log_token_usage("Diagram (flash-lite)", flash_res)
             html_content = flash_res.text.replace("```html", "").replace("```", "").strip()
             
             print("[Step 7] Sending HTML Diagram to Drive...")
@@ -690,6 +730,16 @@ def tamlelan_handler(cloud_event):
         try:
             if os.path.exists(local_audio_path): os.remove(local_audio_path)
         except Exception: pass
+        if succeeded and content_key and not duplicate_of_event_id:
+            try:
+                bucket.blob(f"content_hashes/{content_key}.json").upload_from_string(
+                    json.dumps({"event_id": event_id, "processed_at": time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime()),
+                                "file_stem": os.path.basename(file_name)}),
+                    if_generation_match=0)
+            except PreconditionFailed:
+                pass  # a concurrent invocation for the same content already won the race
+            except Exception as marker_err:
+                print(f"[WARNING] Could not write content-hash dedup marker: {marker_err}")
         try:
             def _safe_num(v):
                 return v if isinstance(v, (int, float)) and not isinstance(v, bool) else None
@@ -717,6 +767,7 @@ def tamlelan_handler(cloud_event):
                 "finished_at": time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime()),
                 "success": succeeded,
                 "error": pipeline_error,
+                "duplicate_of_event_id": duplicate_of_event_id,
                 "duration_sec": _safe_num(duration_sec),
                 "speaker_count": diar.get("speaker_count") if diar else None,
                 "channel_mode": diar.get("channel_mode") if diar else None,
@@ -726,6 +777,7 @@ def tamlelan_handler(cloud_event):
                 "usage": {
                     "pass1_summary": _usage_dict(summary_response),
                     "pass2_transcript": _usage_dict(transcript_response),
+                    "diagram_generation": _usage_dict(flash_res),
                 },
             }
             safe_event_id = str(event_id).replace("/", "_")

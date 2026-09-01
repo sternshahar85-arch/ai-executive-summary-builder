@@ -34,6 +34,11 @@ class FakeBlob:
         self.path = path
         self.deleted = False
         self.uploaded_content = None
+        self.crc32c = None
+        self.md5_hash = None
+
+    def reload(self):
+        pass
 
     def exists(self):
         return not self.deleted

@@ -114,7 +114,9 @@ class TestExpectedParticipants(unittest.TestCase):
     """
     Real-world testing (2 remote participants) showed automatic clustering
     (num_clusters=-1) badly over-segmenting real Zoom audio into 16+ spurious
-    labels. expected_participants lets the user supply the true count instead.
+    labels. room_participants/remote_participants let the user supply the true
+    counts instead of leaving the operator channel hardcoded to exactly 1
+    speaker and the remote channel to automatic detection.
     """
 
     def _fake_diarize_channel(self, calls):
@@ -123,43 +125,43 @@ class TestExpectedParticipants(unittest.TestCase):
             return [(0.0, 1.0, f"{label_prefix}00")]
         return fake
 
-    def test_stereo_with_4_total_participants_remote_gets_3(self):
+    def test_stereo_with_remote_count_supplied(self):
         calls = []
         with patch("scribe.diarize_channel", side_effect=self._fake_diarize_channel(calls)):
             payload = scribe.build_diarization_payload(
                 np.zeros(100), np.zeros(100), has_loopback=True, duration_sec=6.0,
-                expected_participants=4)
-        self.assertIn(("OPERATOR", 1), calls)  # operator always fixed at 1
-        self.assertIn(("REMOTE_", 3), calls)   # 4 total - 1 operator = 3 remote
-        self.assertEqual(payload["expected_participants"], 4)
+                remote_participants=3)
+        self.assertIn(("OPERATOR", 1), calls)  # room_participants unset -> old fast path
+        self.assertIn(("REMOTE_", 3), calls)
+        self.assertEqual(payload["remote_participants"], 3)
 
     def test_mono_with_3_participants_passed_directly(self):
         calls = []
         with patch("scribe.diarize_channel", side_effect=self._fake_diarize_channel(calls)):
             payload = scribe.build_diarization_payload(
                 np.zeros(100), np.zeros(100), has_loopback=False, duration_sec=6.0,
-                expected_participants=3)
+                room_participants=3)
         self.assertIn(("SPEAKER_", 3), calls)
-        self.assertEqual(payload["expected_participants"], 3)
+        self.assertEqual(payload["room_participants"], 3)
 
     def test_none_falls_back_to_automatic_stereo(self):
         calls = []
         with patch("scribe.diarize_channel", side_effect=self._fake_diarize_channel(calls)):
             payload = scribe.build_diarization_payload(
                 np.zeros(100), np.zeros(100), has_loopback=True, duration_sec=6.0,
-                expected_participants=None)
+                room_participants=None, remote_participants=None)
         self.assertIn(("REMOTE_", -1), calls)  # unchanged from pre-existing behavior
-        self.assertIsNone(payload["expected_participants"])
+        self.assertIsNone(payload["room_participants"])
+        self.assertIsNone(payload["remote_participants"])
 
-    def test_solo_stereo_call_of_1_falls_back_to_automatic_remote(self):
-        # A count of 1 (just the operator, e.g. testing alone) doesn't make sense
-        # as "0 remote speakers" -- fall back to automatic rather than requesting
-        # an invalid num_clusters=0.
+    def test_remote_zero_falls_back_to_automatic(self):
+        # 0 remote participants doesn't make sense as a fixed cluster count --
+        # fall back to automatic rather than requesting an invalid num_clusters=0.
         calls = []
         with patch("scribe.diarize_channel", side_effect=self._fake_diarize_channel(calls)):
             scribe.build_diarization_payload(
                 np.zeros(100), np.zeros(100), has_loopback=True, duration_sec=6.0,
-                expected_participants=1)
+                remote_participants=0)
         self.assertIn(("REMOTE_", -1), calls)
 
     def test_mono_zero_or_negative_falls_back_to_automatic(self):
@@ -167,14 +169,59 @@ class TestExpectedParticipants(unittest.TestCase):
         with patch("scribe.diarize_channel", side_effect=self._fake_diarize_channel(calls)):
             scribe.build_diarization_payload(
                 np.zeros(100), np.zeros(100), has_loopback=False, duration_sec=6.0,
-                expected_participants=0)
+                room_participants=0)
         self.assertIn(("SPEAKER_", -1), calls)
+
+
+class TestOperatorChannelRealClustering(unittest.TestCase):
+    """
+    The live defect this fix addresses: the stereo path's left/operator
+    channel was hardcoded to exactly one speaker cluster regardless of actual
+    content, silently merging multiple physical people sharing a room mic
+    into one "OPERATOR" identity. room_participants >= 2 now applies the same
+    real clustering already used for the remote/mono paths to that channel too.
+    """
+
+    def _fake_diarize_channel(self, calls):
+        def fake(samples, label_prefix, num_clusters=-1):
+            calls.append((label_prefix, num_clusters))
+            if label_prefix == "ROOM_":
+                return [(0.0, 2.0, "ROOM_00"), (2.5, 5.0, "ROOM_01")]
+            return [(0.0, 1.0, f"{label_prefix}00")]
+        return fake
+
+    def test_room_participants_2_triggers_real_clustering_not_fast_path(self):
+        calls = []
+        with patch("scribe.diarize_channel", side_effect=self._fake_diarize_channel(calls)):
+            payload = scribe.build_diarization_payload(
+                np.zeros(100), np.zeros(100), has_loopback=True, duration_sec=6.0,
+                room_participants=2)
+        self.assertIn(("ROOM_", 2), calls)
+        self.assertNotIn(("OPERATOR", 1), calls)
+        room_labels = {s["label"] for s in payload["speakers"] if s["label"].startswith("ROOM_")}
+        self.assertEqual(room_labels, {"ROOM_00", "ROOM_01"})
+        self.assertTrue(all(s["channel"] == "left" for s in payload["speakers"] if s["label"].startswith("ROOM_")))
+
+    def test_room_participants_1_or_unset_preserves_exact_fast_path(self):
+        # Regression guard: the common single-headset case must still take
+        # today's exact zero-clustering-compute path, byte-identical output.
+        for room_value in (None, 0, 1):
+            calls = []
+            with patch("scribe.diarize_channel", side_effect=self._fake_diarize_channel(calls)):
+                payload = scribe.build_diarization_payload(
+                    np.zeros(100), np.zeros(100), has_loopback=True, duration_sec=6.0,
+                    room_participants=room_value)
+            self.assertIn(("OPERATOR", 1), calls, f"room_participants={room_value!r} should use the fast path")
+            self.assertNotIn("ROOM_", [c[0] for c in calls])
+            self.assertEqual(
+                [s["label"] for s in payload["speakers"] if s["channel"] == "left"], ["OPERATOR"])
 
 
 class TestStartRecordingParsesParticipantsVar(unittest.TestCase):
     """Verifies the GUI-facing parsing logic in start_recording, without
     actually creating a Tk window (a plain object with .get() stands in for
-    the StringVar)."""
+    the StringVar). Thread args are (status_label, start_btn, end_btn,
+    room_participants, remote_participants) -- indices 3 and 4."""
 
     class FakeVar:
         def __init__(self, value):
@@ -186,7 +233,7 @@ class TestStartRecordingParsesParticipantsVar(unittest.TestCase):
         def config(self, **kwargs):
             pass
 
-    def test_valid_number_threads_through_to_recording_thread(self):
+    def test_valid_numbers_thread_through_to_recording_thread(self):
         captured_args = {}
 
         def fake_thread_init(self, target, args, daemon):
@@ -200,9 +247,11 @@ class TestStartRecordingParsesParticipantsVar(unittest.TestCase):
              patch("scribe.update_meter_ui"):
             scribe.start_recording(
                 self.FakeWidget(), self.FakeWidget(), self.FakeWidget(),
-                self.FakeWidget(), self.FakeWidget(), self.FakeVar("5"))
+                self.FakeWidget(), self.FakeWidget(),
+                self.FakeVar("3"), self.FakeVar("2"))
 
-        self.assertEqual(captured_args["args"][3], 5)
+        self.assertEqual(captured_args["args"][3], 3)
+        self.assertEqual(captured_args["args"][4], 2)
 
     def test_blank_value_results_in_none(self):
         captured_args = {}
@@ -217,11 +266,13 @@ class TestStartRecordingParsesParticipantsVar(unittest.TestCase):
              patch("scribe.update_meter_ui"):
             scribe.start_recording(
                 self.FakeWidget(), self.FakeWidget(), self.FakeWidget(),
-                self.FakeWidget(), self.FakeWidget(), self.FakeVar(""))
+                self.FakeWidget(), self.FakeWidget(),
+                self.FakeVar(""), self.FakeVar(""))
 
         self.assertIsNone(captured_args["args"][3])
+        self.assertIsNone(captured_args["args"][4])
 
-    def test_no_participants_var_results_in_none_backward_compatible(self):
+    def test_no_participant_vars_results_in_none_backward_compatible(self):
         captured_args = {}
 
         def fake_thread_init(self, target, args, daemon):
@@ -237,6 +288,7 @@ class TestStartRecordingParsesParticipantsVar(unittest.TestCase):
                 self.FakeWidget(), self.FakeWidget())
 
         self.assertIsNone(captured_args["args"][3])
+        self.assertIsNone(captured_args["args"][4])
 
 
 class TestDiarizeChannelDtypeConversion(unittest.TestCase):

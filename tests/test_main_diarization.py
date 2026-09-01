@@ -33,6 +33,11 @@ class FakeBlob:
         self.deleted = False
         self._exists = False
         self._content = None
+        self.crc32c = None
+        self.md5_hash = None
+
+    def reload(self):
+        pass
 
     def exists(self):
         return self._exists and not self.deleted
@@ -190,6 +195,36 @@ class TestFormatDiarizationForPrompt(unittest.TestCase):
         block = main.format_diarization_for_prompt(MONO_DIAR)
         self.assertIn("single in-room microphone", block)
         self.assertNotIn("left channel", block)
+
+    def test_stereo_with_multiple_room_speakers_does_not_privilege_operator(self):
+        # room_participants >= 2 was supplied at recording time -- the left
+        # channel got real ROOM_XX clustering instead of one fixed "OPERATOR"
+        # label. The prompt must not claim a single privileged operator
+        # identity for that channel in this case.
+        import main
+        multi_room_diar = {
+            "schema_version": 1,
+            "channel_mode": "stereo_operator_left",
+            "sample_rate": 16000,
+            "speaker_count": 3,
+            "speakers": [
+                {"label": "ROOM_00", "channel": "left"},
+                {"label": "ROOM_01", "channel": "left"},
+                {"label": "REMOTE_00", "channel": "right"},
+            ],
+            "segments": [[0.0, 4.0, "ROOM_00"], [4.1, 8.0, "ROOM_01"], [8.1, 12.0, "REMOTE_00"]],
+        }
+        block = main.format_diarization_for_prompt(multi_room_diar)
+        self.assertNotIn("OPERATOR is the left channel", block)
+        self.assertIn("more than one physical person", block)
+        self.assertIn("ROOM_00", block)
+
+    def test_stereo_single_operator_label_keeps_original_wording(self):
+        # Regression guard: the common case (room_participants unset/1, exact
+        # single "OPERATOR" label) must keep byte-identical prompt wording.
+        import main
+        block = main.format_diarization_for_prompt(STEREO_DIAR)
+        self.assertIn("OPERATOR is the left channel (the person running the", block)
 
     def test_over_cap_omits_segment_list_keeps_roster(self):
         import main

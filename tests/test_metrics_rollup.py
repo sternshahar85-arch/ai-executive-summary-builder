@@ -79,6 +79,29 @@ class TestCostFor(unittest.TestCase):
         records = {r["event_id"]: r for r in rollup.load_records(FIXTURE_PATH)}
         self.assertIsNone(rollup.cost_for(records["evt-4"]))
 
+    def test_diagram_cost_included_when_present(self):
+        record = {
+            "cache_used": False, "cache_write_tokens": None,
+            "diagram_generated": True,
+            "usage": {
+                "pass1_summary": {"prompt_tokens": 10000, "cached_tokens": 0, "output_tokens": 1000, "total_tokens": 11000},
+                "pass2_transcript": {"prompt_tokens": 10000, "cached_tokens": 0, "output_tokens": 2000, "total_tokens": 12000},
+                "diagram_generation": {"prompt_tokens": 4000, "cached_tokens": 0, "output_tokens": 500, "total_tokens": 4500},
+            },
+        }
+        cost = rollup.cost_for(record)
+        # base (pass1+pass2, same shape as evt-1) = 0.076
+        # diagram: 4000*0.25/1e6 + 500*1.50/1e6 = 0.001 + 0.00075 = 0.00175
+        self.assertAlmostEqual(cost, 0.076 + 0.00175, places=6)
+
+    def test_diagram_generated_but_usage_missing_does_not_invalidate_record(self):
+        # evt-3 has diagram_generated=True but no diagram_generation usage entry
+        # (a record predating this field) -- must still price pass1/pass2 normally,
+        # just skip the diagram cost component, matching cache_write_tokens' own
+        # backward-compatible handling of a missing field.
+        records = {r["event_id"]: r for r in rollup.load_records(FIXTURE_PATH)}
+        self.assertIsNotNone(rollup.cost_for(records["evt-3"]))
+
 
 class TestSummarizeAndRender(unittest.TestCase):
     def test_summarize_buckets_and_excludes_failed(self):
