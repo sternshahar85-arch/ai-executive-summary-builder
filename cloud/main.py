@@ -4,13 +4,36 @@ import time
 import wave
 import urllib.request
 import functions_framework
+import httpx
 from google import genai
-from google.genai import types
+from google.genai import types, errors
 from google.cloud import storage
 from google.api_core.exceptions import PreconditionFailed
 from rapidfuzz import fuzz
 
 GROUNDING_THRESHOLD = 80
+
+RETRYABLE_ERRORS = (errors.ServerError, httpx.ReadError, httpx.ConnectError,
+                    httpx.RemoteProtocolError, httpx.ReadTimeout)
+RETRY_MAX_ATTEMPTS = 3
+RETRY_WAIT_SEC = 8
+
+
+def with_retries(label, fn):
+    """
+    Retries fn() up to RETRY_MAX_ATTEMPTS times on transient Gemini server
+    errors (5xx, including the real 503 "high demand" error seen in
+    production) or transient network errors, with a fixed backoff between
+    attempts. Re-raises on the final attempt so real failures still surface.
+    """
+    for attempt in range(1, RETRY_MAX_ATTEMPTS + 1):
+        try:
+            return fn()
+        except RETRYABLE_ERRORS as e:
+            print(f"[WARNING] {label}: transient error on attempt {attempt}/{RETRY_MAX_ATTEMPTS}: {e}")
+            if attempt == RETRY_MAX_ATTEMPTS:
+                raise
+            time.sleep(RETRY_WAIT_SEC)
 
 
 def is_grounded(source_quote, transcript, threshold=GROUNDING_THRESHOLD):
@@ -239,10 +262,18 @@ def tamlelan_handler(cloud_event):
         api_key = os.environ.get("GEMINI_API_KEY")
         client = genai.Client(api_key=api_key)
         
-        gemini_file = client.files.upload(file=local_audio_path)
+        gemini_file = with_retries("file upload", lambda: client.files.upload(file=local_audio_path))
         print("[Step 2] Uploaded to Gemini. Waiting for processing...")
-        
+
+        FILE_PROCESSING_MAX_WAIT_SEC = 300
+        poll_start = time.time()
         while gemini_file.state.name == "PROCESSING":
+            if time.time() - poll_start > FILE_PROCESSING_MAX_WAIT_SEC:
+                raise TimeoutError(
+                    f"Gemini file {gemini_file.name} stuck in PROCESSING for over "
+                    f"{FILE_PROCESSING_MAX_WAIT_SEC}s -- aborting rather than hanging "
+                    f"indefinitely (Cloud Run has a hard request timeout regardless)."
+                )
             time.sleep(2)
             gemini_file = client.files.get(name=gemini_file.name)
 
@@ -417,7 +448,7 @@ def tamlelan_handler(cloud_event):
             "required": ["executive_summary", "attendees", "people_mentioned", "key_topics", "decisions_log", "action_items", "diagram_needed"]
         }
         
-        summary_response = client.models.generate_content(
+        summary_response = with_retries("Pass 1 (summary)", lambda: client.models.generate_content(
             model='gemini-3.1-pro-preview',
             contents=[summary_prompt] if cache else [summary_prompt + diar_block, gemini_file],
             config=types.GenerateContentConfig(
@@ -426,7 +457,7 @@ def tamlelan_handler(cloud_event):
                 temperature=0.2,
                 cached_content=cache.name if cache else None
             )
-        )
+        ))
         log_token_usage("Pass 1 (summary)", summary_response)
 
         raw_text = summary_response.text.replace("```json", "").replace("```", "").strip()
@@ -474,7 +505,7 @@ def tamlelan_handler(cloud_event):
         text -- no preamble, no headings, no commentary.
         """
         
-        transcript_response = client.models.generate_content(
+        transcript_response = with_retries("Pass 2 (transcript)", lambda: client.models.generate_content(
             model='gemini-3.1-pro-preview',
             contents=[transcript_prompt] if cache else [transcript_prompt + diar_block, gemini_file],
             config=types.GenerateContentConfig(
@@ -486,10 +517,15 @@ def tamlelan_handler(cloud_event):
                 # transcript and truncating real meetings mid-way
                 # (finish_reason=MAX_TOKENS). thinking_level="LOW" completes the
                 # full transcript using fewer total tokens. Verified 2026-08-31
-                # against a real 54-min/8-speaker meeting recording.
+                # against a real 54-min/8-speaker meeting recording, and
+                # reconfirmed 2026-09-02: removing thinking_config entirely
+                # reproduces the SAME MAX_TOKENS truncation, not a fix -- keep
+                # this setting. (A separate, still-open transcript-duplication
+                # defect exists independent of this setting; see ASR migration
+                # plan.)
                 thinking_config=types.ThinkingConfig(thinking_level="LOW")
             )
-        )
+        ))
         log_token_usage("Pass 2 (transcript)", transcript_response)
 
         full_transcript_text = transcript_response.text.strip()
