@@ -61,6 +61,14 @@ jobs:
       # Step 2: verify the --function flag actually took effect. This is
       # the exact class of bug that broke four consecutive deployments
       # silently in the past (Ready: True, crashing on every real request).
+      #
+      # Confirmed live 2026-09-02: current gcloud returns this annotation as
+      # a JSON map keyed by container name (e.g.
+      # {"tamlelan-processor-1":"tamlelan_handler"}), not the bare string
+      # README section 6's manual instructions assume -- that doc is stale
+      # relative to current gcloud/Cloud Run behavior. Parsed with jq here
+      # rather than a straight string comparison so the check doesn't
+      # silently want a format that no longer exists.
       # ------------------------------------------------------------------
       - name: Verify build-function-target annotation
         run: |
@@ -69,8 +77,8 @@ jobs:
             --region="$REGION" --project="$PROJECT_ID" \
             --format="value(metadata.annotations['run.googleapis.com/build-function-target'])")
           echo "build-function-target: '$TARGET'"
-          if [ "$TARGET" != "tamlelan_handler" ]; then
-            echo "::error::build-function-target is '$TARGET', expected 'tamlelan_handler'. Traffic will NOT be migrated."
+          if ! echo "$TARGET" | jq -e '[.[]] | length > 0 and all(. == "tamlelan_handler")' >/dev/null 2>&1; then
+            echo "::error::build-function-target is '$TARGET', expected every container's target to be 'tamlelan_handler'. Traffic will NOT be migrated."
             exit 1
           fi
 

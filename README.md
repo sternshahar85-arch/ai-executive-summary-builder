@@ -218,7 +218,10 @@ gcloud run deploy tamlelan-processor --source=./cloud --function=tamlelan_handle
 
 gcloud run revisions describe <NEW_REVISION> --region=us-west1 --project=gen-lang-client-0839027862 \
   --format="value(metadata.annotations['run.googleapis.com/build-function-target'])"
-# MUST print: tamlelan_handler -- if empty, do not migrate traffic, redeploy with the flag
+# MUST print a JSON map with every value "tamlelan_handler", e.g.
+# {"tamlelan-processor-1":"tamlelan_handler"} -- confirmed live 2026-09-02, current
+# gcloud returns this keyed by container name, not a bare string. If empty or any
+# value differs, do not migrate traffic, redeploy with the flag.
 
 # then verify env vars survived (DRIVE_FOLDER_ID, APPS_SCRIPT_URL, GEMINI_API_KEY, WEBHOOK_SECRET)
 
