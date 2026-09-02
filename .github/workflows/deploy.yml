@@ -1,0 +1,145 @@
+name: Deploy tamlelan-processor
+
+# Manual only, by design -- deploys have always been a deliberate action here,
+# not something that should fire automatically on every push. This workflow
+# makes that deliberate action safe, not automatic.
+on:
+  workflow_dispatch:
+
+env:
+  PROJECT_ID: gen-lang-client-0839027862
+  REGION: us-west1
+  SERVICE: tamlelan-processor
+  REQUIRED_ENV_VARS: "DRIVE_FOLDER_ID APPS_SCRIPT_URL GEMINI_API_KEY WEBHOOK_SECRET"
+
+permissions:
+  contents: read
+  id-token: write   # required for Workload Identity Federation
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - id: auth
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ vars.WIF_PROVIDER }}
+          service_account: ${{ vars.WIF_SERVICE_ACCOUNT }}
+
+      - uses: google-github-actions/setup-gcloud@v2
+
+      # ------------------------------------------------------------------
+      # Step 1: deploy with --no-traffic and a unique tag, exactly matching
+      # README section 6's mandatory sequence -- this is that sequence,
+      # encoded as a script instead of a checklist a human has to remember.
+      # ------------------------------------------------------------------
+      - name: Deploy new revision (no traffic yet)
+        id: deploy
+        run: |
+          set -euo pipefail
+          TAG="smoke-${{ github.run_id }}"
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+
+          gcloud run deploy "$SERVICE" \
+            --source=./cloud \
+            --function=tamlelan_handler \
+            --region="$REGION" \
+            --project="$PROJECT_ID" \
+            --no-traffic \
+            --tag="$TAG" \
+            --quiet
+
+          REVISION=$(gcloud run services describe "$SERVICE" \
+            --region="$REGION" --project="$PROJECT_ID" \
+            --format="value(status.traffic[?tag=='$TAG'].revisionName)")
+          echo "revision=$REVISION" >> "$GITHUB_OUTPUT"
+          echo "Deployed revision: $REVISION"
+
+      # ------------------------------------------------------------------
+      # Step 2: verify the --function flag actually took effect. This is
+      # the exact class of bug that broke four consecutive deployments
+      # silently in the past (Ready: True, crashing on every real request).
+      # ------------------------------------------------------------------
+      - name: Verify build-function-target annotation
+        run: |
+          set -euo pipefail
+          TARGET=$(gcloud run revisions describe "${{ steps.deploy.outputs.revision }}" \
+            --region="$REGION" --project="$PROJECT_ID" \
+            --format="value(metadata.annotations['run.googleapis.com/build-function-target'])")
+          echo "build-function-target: '$TARGET'"
+          if [ "$TARGET" != "tamlelan_handler" ]; then
+            echo "::error::build-function-target is '$TARGET', expected 'tamlelan_handler'. Traffic will NOT be migrated."
+            exit 1
+          fi
+
+      # ------------------------------------------------------------------
+      # Step 3: verify all four required env vars are present on the new
+      # revision -- a silent missing/dropped env var is another way past
+      # deploys have broken without anyone noticing until a real meeting ran.
+      # ------------------------------------------------------------------
+      - name: Verify required env vars present
+        run: |
+          set -euo pipefail
+          PRESENT=$(gcloud run revisions describe "${{ steps.deploy.outputs.revision }}" \
+            --region="$REGION" --project="$PROJECT_ID" \
+            --format="value(spec.containers[0].env[].name)")
+          echo "Present env vars: $PRESENT"
+          for VAR in $REQUIRED_ENV_VARS; do
+            if ! echo "$PRESENT" | tr ',' '\n' | grep -qx "$VAR"; then
+              echo "::error::Required env var '$VAR' is missing from the new revision. Traffic will NOT be migrated."
+              exit 1
+            fi
+          done
+
+      # ------------------------------------------------------------------
+      # Step 4: real smoke test -- an authenticated HTTP call to the tagged
+      # revision URL with a synthetic CloudEvent for a non-.wav filename.
+      # main.py's early-exit filter (cloud/main.py, "Ignored", 200) means
+      # this proves the container actually boots and routes a real request
+      # correctly, with zero GCS access, zero Gemini cost, zero side effects.
+      # A 404/500/timeout here is exactly the "Ready: True but broken" failure
+      # mode that reached production undetected before.
+      # ------------------------------------------------------------------
+      - name: Smoke test the new revision
+        run: |
+          set -euo pipefail
+          SMOKE_URL=$(gcloud run services describe "$SERVICE" \
+            --region="$REGION" --project="$PROJECT_ID" \
+            --format="value(status.traffic[?tag=='${{ steps.deploy.outputs.tag }}'].url)")
+          echo "Smoke-testing: $SMOKE_URL"
+
+          TOKEN=$(gcloud auth print-identity-token --audiences="$SMOKE_URL")
+
+          HTTP_CODE=$(curl -s -o /tmp/smoke_response.txt -w "%{http_code}" -X POST "$SMOKE_URL" \
+            -H "Authorization: Bearer $TOKEN" \
+            -H "Content-Type: application/json" \
+            -H "ce-id: smoke-${{ github.run_id }}" \
+            -H "ce-specversion: 1.0" \
+            -H "ce-type: google.cloud.storage.object.v1.finalized" \
+            -H "ce-source: //storage.googleapis.com/projects/_/buckets/tamlelan-inbox-stgliding" \
+            -d '{"bucket": "tamlelan-inbox-stgliding", "name": "smoke-test-not-audio.txt"}')
+
+          echo "HTTP $HTTP_CODE"
+          cat /tmp/smoke_response.txt
+          echo
+
+          if [ "$HTTP_CODE" != "200" ]; then
+            echo "::error::Smoke test got HTTP $HTTP_CODE, expected 200. Traffic will NOT be migrated."
+            exit 1
+          fi
+          if ! grep -q "Ignored" /tmp/smoke_response.txt; then
+            echo "::error::Smoke test got HTTP 200 but unexpected body (expected 'Ignored'). Traffic will NOT be migrated."
+            exit 1
+          fi
+
+      # ------------------------------------------------------------------
+      # Step 5: only reached if every check above passed -- migrate traffic.
+      # ------------------------------------------------------------------
+      - name: Migrate traffic to new revision
+        run: |
+          set -euo pipefail
+          gcloud run services update-traffic "$SERVICE" \
+            --to-latest --region="$REGION" --project="$PROJECT_ID"
+          echo "Traffic migrated to ${{ steps.deploy.outputs.revision }}."
