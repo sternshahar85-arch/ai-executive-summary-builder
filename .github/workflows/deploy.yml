@@ -143,3 +143,4 @@ jobs:
           gcloud run services update-traffic "$SERVICE" \
             --to-latest --region="$REGION" --project="$PROJECT_ID"
           echo "Traffic migrated to ${{ steps.deploy.outputs.revision }}."
+# trigger workflow discovery
