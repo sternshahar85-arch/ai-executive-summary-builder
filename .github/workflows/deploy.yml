@@ -96,7 +96,11 @@ jobs:
             || { echo "::error::Explicit Gemini HTTP timeout removed -- reintroduces the reproduced indefinite hang."; exit 1; }
 
   test-client:
-    runs-on: ubuntu-latest
+    # Windows, not Linux: the recorder is a Windows application and
+    # requirements-client.txt pins PyAudioWPatch, which publishes no Linux wheel
+    # at all ("No matching distribution found" on ubuntu-latest). Running the
+    # client suite on the platform it actually ships to is also more faithful.
+    runs-on: windows-latest
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4

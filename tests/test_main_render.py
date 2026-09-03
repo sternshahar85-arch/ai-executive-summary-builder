@@ -52,7 +52,7 @@ class FakeBlob:
     def download_as_bytes(self):
         return b"FAKE_AUDIO_BYTES"
 
-    def upload_from_string(self, content, if_generation_match=None):
+    def upload_from_string(self, content, if_generation_match=None, content_type=None):
         self.bucket.uploaded_paths.append(self.path)
 
 
