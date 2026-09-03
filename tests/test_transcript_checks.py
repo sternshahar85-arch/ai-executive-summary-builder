@@ -32,6 +32,36 @@ def clean_transcript(n=60, start=0, step=10):
     )
 
 
+class TestLineParsingMatchesRealModelOutput(unittest.TestCase):
+    """The prompt asks for `M:SS [SPEAKER]:` but the model often emits
+    `M:SS SPEAKER:` with no brackets. A bracket-only pattern parsed almost
+    nothing in the 2026-09-03 production run, silently blinding every check in
+    this module and producing a spurious coverage failure."""
+
+    def test_unbracketed_speaker_is_parsed(self):
+        p = tc.parse_lines("0:00 דובר 1: למס הכנסה\n0:15 דובר 2: כן.")
+        self.assertEqual(len(p), 2)
+        self.assertEqual(p[0][2], "דובר 1")
+        self.assertEqual(p[1][1], 15)
+
+    def test_bracketed_speaker_still_parsed(self):
+        p = tc.parse_lines("0:00 [ורד]: שלום")
+        self.assertEqual(len(p), 1)
+        self.assertEqual(p[0][2], "ורד")
+
+    def test_mixed_formats_in_one_transcript(self):
+        p = tc.parse_lines("0:00 [ורד]: א\n0:05 שחר: ב\n0:10 - 0:20: [שקט]")
+        self.assertEqual(len(p), 3)
+
+    def test_coverage_correct_on_unbracketed_transcript(self):
+        """The exact production symptom: a full-length transcript reported as
+        short because none of its lines parsed."""
+        t = "\n".join(f"{i}:00 דובר 1: שורה {i}" for i in range(0, 45))
+        r = tc.check_coverage(t, duration_sec=2681.9)
+        self.assertFalse(r["detected"])
+        self.assertGreater(r["coverage"], 0.95)
+
+
 class TestBlockRepetition(unittest.TestCase):
     def test_clean_transcript_is_not_flagged(self):
         """False-positive guard -- written first deliberately."""

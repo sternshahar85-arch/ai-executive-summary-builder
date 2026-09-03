@@ -25,8 +25,14 @@ Design rules, matching the existing grounding/attendee checks in main.py:
 """
 import re
 
-# `M:SS [SPEAKER]: text`, the format Pass 2 is instructed to emit.
-SPEAKER_LINE = re.compile(r"^\s*(\d+):(\d{2})\s*\[([^\]]+)\]\s*:\s*(.*)$")
+# The prompt specifies `M:SS [SPEAKER]: text`, but the model frequently emits
+# `M:SS SPEAKER: text` with no brackets -- confirmed in the 2026-09-03 production
+# run, where a bracket-only pattern parsed almost nothing, silently blinding every
+# check here and reporting a spurious coverage failure. Parse what the model
+# actually produces, not only what it was asked to produce.
+SPEAKER_LINE = re.compile(
+    r"^\s*(\d+):(\d{2})\s*(?:\[(?P<b>[^\]]{1,60})\]|(?P<p>[^:\[\]\n]{1,60}?))\s*:\s*(?P<text>.*)$"
+)
 # `M:SS - M:SS: [שקט]`, the non-speech form -- carries a timestamp but no speaker.
 SILENCE_LINE = re.compile(r"^\s*(\d+):(\d{2})\s*-\s*\d+:\d{2}\s*:")
 
@@ -54,7 +60,8 @@ def parse_lines(transcript):
             continue
         m = SPEAKER_LINE.match(raw)
         if m:
-            out.append((i, int(m.group(1)) * 60 + int(m.group(2)), m.group(3).strip(), m.group(4)))
+            speaker = (m.group("b") or m.group("p") or "").strip()
+            out.append((i, int(m.group(1)) * 60 + int(m.group(2)), speaker, m.group("text")))
             continue
         s = SILENCE_LINE.match(raw)
         if s:

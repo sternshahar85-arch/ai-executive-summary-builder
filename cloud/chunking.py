@@ -126,10 +126,14 @@ def established_names(text):
     the one thing chunking does not get for free from global diarization."""
     names, seen = [], set()
     for ln in text.splitlines():
-        m = re.match(r"^\s*\d+:\d{2}\s*\[([^\]]+)\]\s*:", ln)
+        # Accepts both `M:SS [NAME]:` and `M:SS NAME:`. A bracket-only pattern
+        # made this return [] for every chunk in the 2026-09-03 production run, so
+        # no name was ever carried forward and later chunks fell back to generic
+        # labels for speakers the earlier chunks had already identified by name.
+        m = re.match(r"^\s*\d+:\d{2}\s*(?:\[([^\]]{1,60})\]|([^:\[\]\n]{1,60}?))\s*:", ln)
         if not m:
             continue
-        label = m.group(1).strip()
+        label = (m.group(1) or m.group(2) or "").strip()
         if label and not _GENERIC_LABEL.match(label) and label not in seen:
             seen.add(label)
             names.append(label)

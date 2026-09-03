@@ -107,6 +107,18 @@ class TestEstablishedNames(unittest.TestCase):
         t = "0:01 [ורד]: א\n0:05 [שחר]: ב\n0:09 [ורד]: ג"
         self.assertEqual(ck.established_names(t), ["ורד", "שחר"])
 
+    def test_unbracketed_names_are_extracted(self):
+        """The model emits `M:SS NAME:` far more often than the bracketed form the
+        prompt asks for. A bracket-only pattern returned [] for every chunk in the
+        2026-09-03 production run, so no name was ever carried forward and later
+        chunks fell back to generic labels for speakers already identified."""
+        t = "0:01 ורד: שלום לכולם\n0:05 דובר 1: כן\n0:09 שחר: בסדר\n0:12 ROOM_00: אה"
+        self.assertEqual(ck.established_names(t), ["ורד", "שחר"])
+
+    def test_mixed_bracketed_and_unbracketed(self):
+        t = "0:01 [ורד]: א\n0:05 חיים: ב\n0:09 דובר 2: ג"
+        self.assertEqual(ck.established_names(t), ["ורד", "חיים"])
+
     def test_generic_labels_excluded(self):
         """דובר N / ROOM_xx are placeholders for 'could not name', so carrying
         them forward would teach the next chunk a name that isn't one."""
