@@ -118,7 +118,12 @@ jobs:
             --format=json | jq -r --arg TAG "${{ steps.deploy.outputs.tag }}" '.status.traffic[] | select(.tag==$TAG) | .url')
           echo "Smoke-testing: $SMOKE_URL"
 
-          TOKEN=$(gcloud auth print-identity-token --audiences="$SMOKE_URL")
+          # Confirmed live 2026-09-02: under Workload Identity Federation, the
+          # ambient credential isn't directly usable with --audiences ("Invalid
+          # account type") -- needs explicit impersonation to mint the token.
+          TOKEN=$(gcloud auth print-identity-token \
+            --impersonate-service-account="${{ vars.WIF_SERVICE_ACCOUNT }}" \
+            --audiences="$SMOKE_URL")
 
           HTTP_CODE=$(curl -s -o /tmp/smoke_response.txt -w "%{http_code}" -X POST "$SMOKE_URL" \
             -H "Authorization: Bearer $TOKEN" \
