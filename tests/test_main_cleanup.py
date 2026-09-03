@@ -54,7 +54,7 @@ class FakeBlob:
     def download_as_bytes(self):
         return b"FAKE_AUDIO_BYTES"
 
-    def upload_from_string(self, content, if_generation_match=None):
+    def upload_from_string(self, content, if_generation_match=None, content_type=None):
         self.uploaded_content = content
         self.bucket.uploaded_paths.append(self.path)
 
@@ -69,6 +69,16 @@ class FakeBucket:
         if path not in self.blobs:
             self.blobs[path] = FakeBlob(self, path)
         return self.blobs[path]
+
+    def copy_blob(self, source_blob, destination_bucket, new_name):
+        """Server-side copy, as used by main.py's failed/ preservation path."""
+        dest = destination_bucket.blob(new_name)
+        dest.uploaded_content = source_blob.download_as_bytes()
+        dest.deleted = False
+        if hasattr(dest, "_exists"):
+            dest._exists = True
+        destination_bucket.uploaded_paths.append(new_name)
+        return dest
 
 
 class FakeGeminiFile:

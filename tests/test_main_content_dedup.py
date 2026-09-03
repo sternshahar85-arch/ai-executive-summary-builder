@@ -96,6 +96,16 @@ class FakeBucket:
             self.blobs[path] = FakeBlob(self, path)
         return self.blobs[path]
 
+    def copy_blob(self, source_blob, destination_bucket, new_name):
+        """Server-side copy, as used by main.py's failed/ preservation path."""
+        dest = destination_bucket.blob(new_name)
+        dest.uploaded_content = source_blob.download_as_bytes()
+        dest.deleted = False
+        if hasattr(dest, "_exists"):
+            dest._exists = True
+        destination_bucket.uploaded_paths.append(new_name)
+        return dest
+
     def set_crc32c(self, wav_name, crc32c_value):
         self.blob(wav_name).crc32c = crc32c_value
 

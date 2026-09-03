@@ -89,6 +89,16 @@ class FakeBucket:
             self.blobs[path] = FakeBlob(self, path)
         return self.blobs[path]
 
+    def copy_blob(self, source_blob, destination_bucket, new_name):
+        """Server-side copy, as used by main.py's failed/ preservation path."""
+        dest = destination_bucket.blob(new_name)
+        dest.uploaded_content = source_blob.download_as_bytes()
+        dest.deleted = False
+        if hasattr(dest, "_exists"):
+            dest._exists = True
+        destination_bucket.uploaded_paths.append(new_name)
+        return dest
+
     def seed_companion(self, wav_name, diar_dict):
         companion_path = wav_name[:-4] + ".diarization.json"
         blob = self.blob(companion_path)
@@ -202,8 +212,13 @@ class TestMetricsHappyPath(unittest.TestCase):
         self.assertAlmostEqual(record["duration_sec"], 2.0, places=1)
         self.assertEqual(record["speaker_count"], 3)
         self.assertEqual(record["channel_mode"], "stereo_operator_left")
-        self.assertTrue(record["cache_used"])
-        self.assertEqual(record["cache_write_tokens"], 9001)
+        # Explicit context caching was removed on 2026-09-03 when Pass 2 became
+        # chunked: a single-use cache costs more than not caching at all. The field
+        # is kept so historical records stay comparable.
+        self.assertFalse(record["cache_used"])
+        self.assertEqual(record["schema_version"], 2)
+        self.assertIn("transcript_quality", record)
+        self.assertIsNone(record["cache_write_tokens"])  # no cache is created any more
         self.assertFalse(record["diagram_generated"])
         self.assertEqual(record["usage"]["pass1_summary"], {
             "prompt_tokens": 1000, "cached_tokens": 500, "output_tokens": 200, "total_tokens": 1200,

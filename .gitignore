@@ -24,7 +24,11 @@ Tamlelan_Backups/
 
 # Audio recordings — real meeting content, not source
 *.wav
-!debug_audio.wav
+
+# User scratch/handoff space -- holds real meeting summaries and transcripts
+# (named third parties). Previously protected only by convention, which meant a
+# single `git add -A` could have published real meeting content. Never commit.
+RECENT/
 
 # Ad-hoc investigation/validation scripts -- exploratory tools with hardcoded
 # local paths, not production source. May contain a fetched copy of the

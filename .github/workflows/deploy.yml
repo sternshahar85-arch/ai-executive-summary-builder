@@ -1,24 +1,131 @@
 name: Deploy tamlelan-processor
 
-# Manual only, by design -- deploys have always been a deliberate action here,
-# not something that should fire automatically on every push. This workflow
-# makes that deliberate action safe, not automatic.
+# Tests run on every push and pull request. Deployment stays MANUAL by design --
+# deploys have always been a deliberate action here. The workflow makes that
+# deliberate action safe, not automatic.
 on:
   workflow_dispatch:
+  push:
+  pull_request:
 
 env:
   PROJECT_ID: gen-lang-client-0839027862
   REGION: us-west1
   SERVICE: tamlelan-processor
   REQUIRED_ENV_VARS: "DRIVE_FOLDER_ID APPS_SCRIPT_URL GEMINI_API_KEY WEBHOOK_SECRET"
+  # Cloud Run sizing is pinned here rather than inherited, so it is reviewable in
+  # git. 540s did not fit the workload: the happy path measured ~430s and a single
+  # retry of the transcript pass reached ~588s, past the limit -- and a hard kill
+  # skips the finally block entirely, leaving no failed/ copy and no alert.
+  RUN_TIMEOUT: "3600"
+  RUN_MEMORY: "2Gi"
+
+# Two dispatches racing would let --to-revisions target a revision the other job
+# deployed. Serialise them.
+concurrency:
+  group: deploy-tamlelan
+  cancel-in-progress: false
 
 permissions:
   contents: read
   id-token: write   # required for Workload Identity Federation
 
 jobs:
-  deploy:
+  # ====================================================================
+  # The gate. Before this existed the pipeline deployed without ever
+  # running the test suite -- it would happily ship a revision whose
+  # tests were 100% red, and the Phase 1 retry/timeout code reached
+  # production having been exercised by neither a test nor a smoke check.
+  # ====================================================================
+  test-cloud:
     runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'   # matches the Cloud Run runtime
+
+      # Deliberately ONLY cloud/requirements.txt. Installing anything extra here
+      # would let a missing dependency pass CI and crash on Cloud Run.
+      - name: Install cloud dependencies
+        run: pip install -r cloud/requirements.txt
+
+      - name: Cloud pipeline suite
+        run: |
+          set -euo pipefail
+          python -m unittest discover -s tests -p "test_main_*.py" -v 2>&1 | tee /tmp/main.log
+          COUNT=$(grep -oP '^Ran \K[0-9]+' /tmp/main.log)
+          echo "cloud pipeline tests: $COUNT"
+          if [ "$COUNT" -lt 62 ]; then
+            echo "::error::Ran $COUNT cloud tests, expected >= 62. Tests were deleted or failed to load."
+            exit 1
+          fi
+
+      - name: Metrics suite
+        run: python -m unittest discover -s tests -p "test_metrics_*.py" -v
+
+      - name: Transcript-quality suite
+        run: python -m unittest discover -s tests -p "test_transcript_*.py" -v
+
+      - name: Chunking suite
+        run: python -m unittest discover -s tests -p "test_chunking.py" -v
+
+      # A fake diverging from the real API does not fail a suite -- it silently
+      # deletes coverage. This happened for months: six of the nine FakeBlob
+      # copies lacked the content_type kwarg, so ~40 of 49 runs never executed
+      # the metrics path while printing a warning nobody read.
+      - name: Fail on test-fake API drift
+        run: |
+          set -euo pipefail
+          # Match the SIGNATURE-MISMATCH shape only. An earlier version also
+          # matched "Could not write metrics record", which is emitted
+          # deliberately by test_metrics_write_failure_does_not_affect_pipeline_result
+          # simulating a GCS failure -- a guard that cannot tell an intentional
+          # simulation from real drift just trains people to ignore it.
+          if grep -qE "unexpected keyword argument|takes [0-9]+ positional arguments? but|missing [0-9]+ required positional" /tmp/main.log; then
+            echo "::error::A test fake has diverged from the real API -- a code path is silently untested."
+            grep -nE "unexpected keyword argument|takes [0-9]+ positional arguments? but|missing [0-9]+ required positional" /tmp/main.log | head -5
+            exit 1
+          fi
+
+      # Config lines whose removal is silent but expensive. Each is tied to a
+      # measured production failure, so a plain grep is worth its keep.
+      - name: Load-bearing configuration assertions
+        run: |
+          set -euo pipefail
+          grep -q 'thinking_level="LOW"' cloud/main.py \
+            || { echo "::error::thinking_level=LOW removed -- reintroduces the confirmed MAX_TOKENS truncation."; exit 1; }
+          grep -q 'include_turns=False' cloud/main.py \
+            || { echo "::error::Pass 2 lost include_turns=False -- reintroduces the diarization template echo (measured 1.00)."; exit 1; }
+          grep -q 'HttpOptions(timeout=' cloud/main.py \
+            || { echo "::error::Explicit Gemini HTTP timeout removed -- reintroduces the reproduced indefinite hang."; exit 1; }
+
+  test-client:
+    # Windows, not Linux: the recorder is a Windows application and
+    # requirements-client.txt pins PyAudioWPatch, which publishes no Linux wheel
+    # at all ("No matching distribution found" on ubuntu-latest). Running the
+    # client suite on the platform it actually ships to is also more faithful.
+    runs-on: windows-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      # Separate job, not a later step: the client and cloud environments are
+      # genuinely isolated (the client suite needs numpy/scipy, which must never
+      # be present when the cloud suite runs).
+      - name: Install client dependencies
+        run: pip install -r requirements-client.txt
+      - name: Client suite
+        run: python -m unittest discover -s tests -p "test_scribe_*.py" -v
+
+  deploy:
+    needs: [test-cloud, test-client]     # <-- structural gate, not a reorderable step
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
 
@@ -32,14 +139,14 @@ jobs:
 
       # ------------------------------------------------------------------
       # Step 1: deploy with --no-traffic and a unique tag, exactly matching
-      # README section 6's mandatory sequence -- this is that sequence,
-      # encoded as a script instead of a checklist a human has to remember.
+      # README section 6's mandatory sequence -- that sequence encoded as a
+      # script instead of a checklist a human has to remember.
       # ------------------------------------------------------------------
       - name: Deploy new revision (no traffic yet)
         id: deploy
         run: |
           set -euo pipefail
-          TAG="smoke-${{ github.run_id }}"
+          TAG="rev-${{ github.run_id }}"
           echo "tag=$TAG" >> "$GITHUB_OUTPUT"
 
           gcloud run deploy "$SERVICE" \
@@ -47,6 +154,8 @@ jobs:
             --function=tamlelan_handler \
             --region="$REGION" \
             --project="$PROJECT_ID" \
+            --timeout="$RUN_TIMEOUT" \
+            --memory="$RUN_MEMORY" \
             --no-traffic \
             --tag="$TAG" \
             --quiet
@@ -54,21 +163,22 @@ jobs:
           REVISION=$(gcloud run services describe "$SERVICE" \
             --region="$REGION" --project="$PROJECT_ID" \
             --format=json | jq -r --arg TAG "$TAG" '.status.traffic[] | select(.tag==$TAG) | .revisionName')
+          if [ -z "$REVISION" ] || [ "$REVISION" = "null" ]; then
+            echo "::error::Could not resolve the newly deployed revision name."
+            exit 1
+          fi
           echo "revision=$REVISION" >> "$GITHUB_OUTPUT"
           echo "Deployed revision: $REVISION"
 
       # ------------------------------------------------------------------
-      # Step 2: verify the --function flag actually took effect. This is
-      # the exact class of bug that broke four consecutive deployments
-      # silently in the past (Ready: True, crashing on every real request).
+      # Step 2: verify the --function flag actually took effect. This is the
+      # exact class of bug that broke four consecutive deployments silently
+      # in the past (Ready: True, crashing on every real request).
       #
-      # Confirmed live 2026-09-02: current gcloud returns this annotation as
-      # a JSON map keyed by container name (e.g.
-      # {"tamlelan-processor-1":"tamlelan_handler"}), not the bare string
-      # README section 6's manual instructions assume -- that doc is stale
-      # relative to current gcloud/Cloud Run behavior. Parsed with jq here
-      # rather than a straight string comparison so the check doesn't
-      # silently want a format that no longer exists.
+      # Confirmed live 2026-09-02: current gcloud returns this annotation as a
+      # JSON map keyed by container name, not the bare string README section 6
+      # assumes. Parsed with jq so the check can't silently want a format that
+      # no longer exists.
       # ------------------------------------------------------------------
       - name: Verify build-function-target annotation
         run: |
@@ -83,77 +193,70 @@ jobs:
           fi
 
       # ------------------------------------------------------------------
-      # Step 3: verify all four required env vars are present on the new
-      # revision -- a silent missing/dropped env var is another way past
-      # deploys have broken without anyone noticing until a real meeting ran.
+      # Step 3: all four env vars present AND non-empty. Name-only checking
+      # would pass a revision with GEMINI_API_KEY="".
       # ------------------------------------------------------------------
-      - name: Verify required env vars present
+      - name: Verify required env vars present and non-empty
         run: |
           set -euo pipefail
-          PRESENT=$(gcloud run revisions describe "${{ steps.deploy.outputs.revision }}" \
-            --region="$REGION" --project="$PROJECT_ID" \
-            --format="value(spec.containers[0].env[].name)")
-          echo "Present env vars: $PRESENT"
+          ENV_JSON=$(gcloud run revisions describe "${{ steps.deploy.outputs.revision }}" \
+            --region="$REGION" --project="$PROJECT_ID" --format=json \
+            | jq -c '[.spec.containers[].env[]?]')
           for VAR in $REQUIRED_ENV_VARS; do
-            if ! echo "$PRESENT" | tr ';' '\n' | grep -qx "$VAR"; then
-              echo "::error::Required env var '$VAR' is missing from the new revision. Traffic will NOT be migrated."
+            if ! echo "$ENV_JSON" | jq -e --arg V "$VAR" \
+                 '[.[] | select(.name==$V)] | length > 0 and (((.[0].value // "") != "") or (.[0] | has("valueFrom")))' >/dev/null; then
+              echo "::error::Required env var '$VAR' is missing or empty on the new revision. Traffic will NOT be migrated."
               exit 1
             fi
           done
+          echo "All required env vars present and populated."
 
       # ------------------------------------------------------------------
-      # Step 4: real smoke test -- an authenticated HTTP call to the tagged
-      # revision URL with a synthetic CloudEvent for a non-.wav filename.
-      # main.py's early-exit filter (cloud/main.py, "Ignored", 200) means
-      # this proves the container actually boots and routes a real request
-      # correctly, with zero GCS access, zero Gemini cost, zero side effects.
-      # A 404/500/timeout here is exactly the "Ready: True but broken" failure
-      # mode that reached production undetected before.
+      # The former step 4 (synthetic CloudEvent smoke test) has been REMOVED.
+      #
+      # Root cause of its long-running 404, found 2026-09-03: the service has
+      # ingress=internal. Ingress is evaluated BEFORE IAM, which is why the call
+      # failed identically with and without an auth token, and why it failed
+      # against the known-good production URL too. A GitHub runner is public
+      # internet, so it was rejected at the network edge every time -- no payload
+      # shape could ever have worked.
+      #
+      # Keeping ingress=internal is the right security posture, so the test is
+      # dropped rather than the setting weakened. Its value is replaced by the
+      # test-cloud gate above, which exercises far more than the six-line
+      # early-exit filter the smoke test reached. A --no-traffic tagged revision
+      # can never be exercised by real Eventarc anyway, so any pre-migration
+      # smoke test was always a synthetic simulation.
       # ------------------------------------------------------------------
-      - name: Smoke test the new revision
-        run: |
-          set -euo pipefail
-          SMOKE_URL=$(gcloud run services describe "$SERVICE" \
-            --region="$REGION" --project="$PROJECT_ID" \
-            --format=json | jq -r --arg TAG "${{ steps.deploy.outputs.tag }}" '.status.traffic[] | select(.tag==$TAG) | .url')
-          echo "Smoke-testing: $SMOKE_URL"
-
-          # Confirmed live 2026-09-02: under Workload Identity Federation, the
-          # ambient credential isn't directly usable with --audiences ("Invalid
-          # account type") -- needs explicit impersonation to mint the token.
-          TOKEN=$(gcloud auth print-identity-token \
-            --impersonate-service-account="${{ vars.WIF_SERVICE_ACCOUNT }}" \
-            --audiences="$SMOKE_URL")
-
-          HTTP_CODE=$(curl -s -o /tmp/smoke_response.txt -w "%{http_code}" -X POST "$SMOKE_URL" \
-            -H "Authorization: Bearer $TOKEN" \
-            -H "Content-Type: application/json" \
-            -H "ce-id: smoke-${{ github.run_id }}" \
-            -H "ce-specversion: 1.0" \
-            -H "ce-type: google.cloud.storage.object.v1.finalized" \
-            -H "ce-source: //storage.googleapis.com/projects/_/buckets/tamlelan-inbox-stgliding" \
-            -d '{"bucket": "tamlelan-inbox-stgliding", "name": "smoke-test-not-audio.txt"}')
-
-          echo "HTTP $HTTP_CODE"
-          cat /tmp/smoke_response.txt
-          echo
-
-          if [ "$HTTP_CODE" != "200" ]; then
-            echo "::error::Smoke test got HTTP $HTTP_CODE, expected 200. Traffic will NOT be migrated."
-            exit 1
-          fi
-          if ! grep -q "Ignored" /tmp/smoke_response.txt; then
-            echo "::error::Smoke test got HTTP 200 but unexpected body (expected 'Ignored'). Traffic will NOT be migrated."
-            exit 1
-          fi
 
       # ------------------------------------------------------------------
-      # Step 5: only reached if every check above passed -- migrate traffic.
+      # Step 4: migrate traffic to the revision that was actually verified.
+      # --to-latest routes to the newest revision by creation time, which is
+      # not necessarily the one steps 2-3 checked.
       # ------------------------------------------------------------------
-      - name: Migrate traffic to new revision
+      - name: Migrate traffic to the verified revision
         run: |
           set -euo pipefail
           gcloud run services update-traffic "$SERVICE" \
-            --to-latest --region="$REGION" --project="$PROJECT_ID"
-          echo "Traffic migrated to ${{ steps.deploy.outputs.revision }}."
-# trigger workflow discovery
+            --to-revisions="${{ steps.deploy.outputs.revision }}=100" \
+            --region="$REGION" --project="$PROJECT_ID"
+
+      # ------------------------------------------------------------------
+      # Step 5: confirm the migration actually landed. Previously the workflow
+      # ended on the update-traffic call, so a partial migration reported success.
+      # ------------------------------------------------------------------
+      - name: Verify traffic landed on the verified revision
+        run: |
+          set -euo pipefail
+          SERVING=$(gcloud run services describe "$SERVICE" \
+            --region="$REGION" --project="$PROJECT_ID" --format=json \
+            | jq -r '.status.traffic[] | select(.percent==100) | .revisionName' | head -1)
+          echo "Serving: $SERVING"
+          if [ "$SERVING" != "${{ steps.deploy.outputs.revision }}" ]; then
+            echo "::error::Expected ${{ steps.deploy.outputs.revision }} to serve 100% of traffic, but '$SERVING' does."
+            exit 1
+          fi
+          gcloud run services update-traffic "$SERVICE" \
+            --remove-tags="${{ steps.deploy.outputs.tag }}" \
+            --region="$REGION" --project="$PROJECT_ID" --quiet || true
+          echo "Deployed and serving: ${{ steps.deploy.outputs.revision }}"
