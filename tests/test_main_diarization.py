@@ -73,6 +73,16 @@ class FakeBucket:
             self.blobs[path] = FakeBlob(self, path)
         return self.blobs[path]
 
+    def copy_blob(self, source_blob, destination_bucket, new_name):
+        """Server-side copy, as used by main.py's failed/ preservation path."""
+        dest = destination_bucket.blob(new_name)
+        dest.uploaded_content = source_blob.download_as_bytes()
+        dest.deleted = False
+        if hasattr(dest, "_exists"):
+            dest._exists = True
+        destination_bucket.uploaded_paths.append(new_name)
+        return dest
+
     def seed_companion(self, wav_name, diar_dict):
         """Pre-populate a companion diarization file as if the client uploaded it."""
         companion_path = wav_name[:-4] + ".diarization.json"
@@ -276,18 +286,21 @@ class TestEndToEndGracefulDegradation(unittest.TestCase):
     def test_with_companion_both_prompts_get_speaker_data(self):
         bucket = FakeBucket()
         bucket.seed_companion("meeting.wav", STEREO_DIAR)
-        result, p1, p2, md, _, cache_contents = run_handler(bucket, base_summary_fixture(2), "evt-diar-1")
+        result, p1, p2, md, _, _cache_contents = run_handler(bucket, base_summary_fixture(2), "evt-diar-1")
         self.assertEqual(result, ("Success", 200))
-        # Pass 1/2 prompts no longer carry the diarization block directly -- it's
-        # cached alongside the audio instead (Root Cause A fix), so both prompts
-        # are now just their own instruction text.
-        self.assertNotIn("SPEAKER TURN DATA", p1)
-        self.assertNotIn("SPEAKER TURN DATA", p2)
-        # The diarization block must be present in what actually got cached.
-        self.assertTrue(
-            any("SPEAKER TURN DATA" in c for c in cache_contents if isinstance(c, str)),
-            "Expected the diarization block in the cached content, not the per-pass prompt",
-        )
+        # Both prompts carry the diarization block inline again: explicit context
+        # caching was removed on 2026-09-03 once Pass 2 became chunked, because a
+        # single-use cache costs more than not caching.
+        self.assertIn("SPEAKER TURN DATA", p1)
+        self.assertIn("SPEAKER TURN DATA", p2)
+        # Pass 1 keeps the turn-by-turn list; Pass 2 must NOT get it. Feeding the
+        # turn list to Pass 2 made the model emit one line per segment and copy its
+        # timestamp and label instead of transcribing (measured echo 1.00, 41%
+        # duplicated content). This assertion is the regression guard for that.
+        self.assertIn("Speaking turns", p1)
+        self.assertNotIn("Speaking turns", p2)
+        # ...but Pass 2 must still know how many voices to expect.
+        self.assertIn("distinct speaking voices", p2)
 
     def test_without_companion_neither_prompt_mentions_speaker_data(self):
         bucket = FakeBucket()  # no companion seeded

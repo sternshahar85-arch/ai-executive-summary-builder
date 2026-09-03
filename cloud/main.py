@@ -1,8 +1,10 @@
 import os
+import re
 import json
 import time
 import wave
 import urllib.request
+import urllib.error
 import functions_framework
 import httpx
 from google import genai
@@ -11,12 +13,37 @@ from google.cloud import storage
 from google.api_core.exceptions import PreconditionFailed
 from rapidfuzz import fuzz
 
+import chunking
+import transcript_checks
+
 GROUNDING_THRESHOLD = 80
 
+# Promoted from a handler local so the chunked Pass 2 can share it.
+FILE_PROCESSING_MAX_WAIT_SEC = 300
+
+# google-genai leaves HttpOptions.timeout unset, which means a stalled call blocks
+# forever. Reproduced 2026-09-03 as a 64-minute hang with 1.4s of CPU inside
+# caches.create(), and twice during the August investigation. Cloud Run kills the
+# request at its own timeout with no finally block and no alert, so an explicit
+# per-call bound is what turns a silent hang into a retryable error.
+GEMINI_HTTP_TIMEOUT_MS = 300_000
+
 RETRYABLE_ERRORS = (errors.ServerError, httpx.ReadError, httpx.ConnectError,
-                    httpx.RemoteProtocolError, httpx.ReadTimeout)
+                    httpx.RemoteProtocolError, httpx.ReadTimeout,
+                    # The Drive webhook is called through urllib, not httpx, so its
+                    # transient failures raise a different family entirely.
+                    urllib.error.URLError, TimeoutError)
 RETRY_MAX_ATTEMPTS = 3
 RETRY_WAIT_SEC = 8
+
+# urlopen defaults to no timeout, so a hung Apps Script blocked until Cloud Run
+# killed the whole request -- taking the finally block, the failed/ preservation
+# and the alert down with it.
+DRIVE_WEBHOOK_TIMEOUT_SEC = 60
+
+# Diarization labels are interpolated into both prompts; a label is an identifier
+# like "ROOM_00" or a short name, never prose. Anything longer is not a label.
+MAX_LABEL_CHARS = 40
 
 
 def with_retries(label, fn):
@@ -84,6 +111,29 @@ def load_diarization(bucket, file_name):
             return None
         if diar.get("channel_mode") not in ("stereo_operator_left", "mono_single_track"):
             return None
+
+        # Validate segment CONTENTS, not just that segments is a list. This object
+        # is uploaded by whoever holds the recorder credential, and its labels are
+        # interpolated straight into both Gemini prompts -- so an unvalidated label
+        # is a prompt-injection channel that turns a write-only, correctly-scoped
+        # credential into control over what lands in the owner's Drive. Non-numeric
+        # times were also a crash: _format_mmss/int() raised outside this function's
+        # try, failing the whole pipeline.
+        clean = []
+        for seg in diar["segments"]:
+            if not isinstance(seg, (list, tuple)) or len(seg) < 3:
+                continue
+            try:
+                start, end = float(seg[0]), float(seg[1])
+            except (TypeError, ValueError):
+                continue
+            if not isinstance(seg[2], str):
+                continue
+            label = re.sub(r"[^\w֐-׿ .\-]", "", seg[2])[:MAX_LABEL_CHARS].strip()
+            if not label:
+                continue
+            clean.append([start, end, label])
+        diar["segments"] = clean
         return diar
     except Exception as e:
         print(f"[WARNING] Could not load diarization companion for {file_name}: {e}")
@@ -95,7 +145,7 @@ def _format_mmss(seconds):
     return f"{seconds // 60}:{seconds % 60:02d}"
 
 
-def format_diarization_for_prompt(diar):
+def format_diarization_for_prompt(diar, include_turns=True):
     """
     Returns "" when diar is None (graceful degradation -- both prompts are then
     byte-identical to their pre-diarization form). Otherwise returns a prompt
@@ -148,27 +198,43 @@ def format_diarization_for_prompt(diar):
         "",
     ]
 
-    if len(segments) > MAX_PROMPT_SEGMENTS:
-        lines.append(
-            f"(Turn-by-turn list omitted -- {len(segments)} segments exceeds the prompt "
-            f"limit. Use the speaker count and channel information above.)"
-        )
-    else:
+    turns_included = include_turns and len(segments) <= MAX_PROMPT_SEGMENTS
+    if turns_included:
         lines.append("Speaking turns (start-end, label):")
         for seg in segments:
             if len(seg) < 3:
                 continue
             start, end, label = seg[0], seg[1], seg[2]
             lines.append(f"{_format_mmss(start)}-{_format_mmss(end)} {label}")
+    elif not include_turns:
+        lines.append(
+            "(Turn-by-turn list deliberately omitted -- see the note in Pass 2.)"
+        )
+    else:
+        lines.append(
+            f"(Turn-by-turn list omitted -- {len(segments)} segments exceeds the prompt "
+            f"limit. Use the speaker count and channel information above.)"
+        )
 
     lines.append("")
-    lines.append(
-        "Use these turn boundaries as authoritative for WHEN the speaker changes and for "
-        "HOW MANY distinct people speak. The labels are anonymous -- resolve each one to a "
-        "real name yourself from the audio (e.g. when someone introduces themselves) and "
-        "use the real name in your output. If you cannot resolve a label to a real name, "
-        "keep the anonymous label."
-    )
+    if turns_included:
+        lines.append(
+            "Use these turn boundaries as authoritative for WHEN the speaker changes and for "
+            "HOW MANY distinct people speak. The labels are anonymous -- resolve each one to a "
+            "real name yourself from the audio (e.g. when someone introduces themselves) and "
+            "use the real name in your output. If you cannot resolve a label to a real name, "
+            "keep the anonymous label."
+        )
+    else:
+        # Without the turn list, an instruction to "use these turn boundaries" has
+        # no referent -- and pointing the model at a turn list is exactly what made
+        # it emit one line per segment instead of transcribing (echo 1.00).
+        lines.append(
+            "Use the speaker count above as authoritative for HOW MANY distinct people "
+            "speak. Determine WHEN each speaker changes from the audio itself. Resolve "
+            "each voice to a real name from the audio (e.g. when someone introduces "
+            "themselves); if you cannot, use a stable generic label."
+        )
 
     return "\n\n" + "\n".join(lines)
 
@@ -185,6 +251,210 @@ def log_token_usage(label, response):
         print(f"[Usage] {label}: prompt_tokens={prompt} cached_tokens={cached} total_tokens={total}")
     except Exception as usage_err:
         print(f"[Usage] {label}: could not read usage_metadata ({usage_err})")
+
+
+_MERMAID_DANGEROUS = re.compile(r"(?i)(<\s*/?\s*\w|script|javascript\s*:|on\w+\s*=|&#|data\s*:)")
+
+
+def sanitize_mermaid(text):
+    """Reduce model output to a safe Mermaid graph body, or "" if it isn't one.
+
+    The model is prompted for graph source only, but a prompt is a request, not a
+    guarantee -- and this content derives from untrusted meeting speech. Anything
+    that could become markup is removed rather than trusted."""
+    if not text:
+        return ""
+    body = text.replace("```mermaid", "").replace("```html", "").replace("```", "").strip()
+    kept = []
+    for line in body.splitlines():
+        if _MERMAID_DANGEROUS.search(line):
+            continue
+        kept.append(line.replace("<", "").replace("&", "&amp;"))
+    body = "\n".join(kept).strip()
+    if not body:
+        return ""
+    # Must actually look like a Mermaid graph, or we are rendering arbitrary text.
+    first = body.splitlines()[0].strip().lower()
+    if not (first.startswith("flowchart") or first.startswith("graph")):
+        return ""
+    return body[:20000]
+
+
+def render_diagram_html(mermaid_body):
+    """Build the diagram page locally from a fixed template.
+
+    The Content-Security-Policy is defence in depth: even if something slipped
+    past sanitize_mermaid, inline script cannot execute and nothing can be
+    exfiltrated to an arbitrary host."""
+    return f"""<!DOCTYPE html>
+<html dir="rtl">
+<head>
+<meta charset="UTF-8">
+<meta http-equiv="Content-Security-Policy"
+      content="default-src 'none'; script-src https://cdn.jsdelivr.net 'unsafe-eval'; style-src 'unsafe-inline'; font-src data:;">
+<style>body {{ background-color: #121212; color: white; display: flex; justify-content: center; align-items: center; min-height: 100vh; margin: 0; font-family: Arial, sans-serif; }}</style>
+</head>
+<body>
+<div class="mermaid">
+{mermaid_body}
+</div>
+<script type="module">
+import mermaid from 'https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.esm.min.mjs';
+mermaid.initialize({{ startOnLoad: true, theme: 'dark' }});
+</script>
+</body>
+</html>"""
+
+
+def _sum_chunk_usage(chunk_reports):
+    """Aggregate per-chunk token usage into one record-shaped dict.
+
+    Pass 2 is no longer a single call, so the metrics record sums its windows."""
+    if not chunk_reports:
+        return None
+    total = {"prompt_tokens": 0, "cached_tokens": 0, "output_tokens": 0, "total_tokens": 0}
+    seen = False
+    for rep in chunk_reports:
+        u = rep.get("usage") or {}
+        for k in total:
+            v = u.get(k)
+            if isinstance(v, (int, float)):
+                total[k] += v
+                seen = True
+    return total if seen else None
+
+
+def _upload_and_wait(client, path, label):
+    """Upload one file and block until Gemini reports it ACTIVE, with a bound."""
+    gfile = with_retries(f"{label} upload", lambda: client.files.upload(file=path))
+    poll_start = time.time()
+    while gfile.state.name == "PROCESSING":
+        if time.time() - poll_start > FILE_PROCESSING_MAX_WAIT_SEC:
+            raise TimeoutError(
+                f"Gemini file {gfile.name} ({label}) stuck in PROCESSING for over "
+                f"{FILE_PROCESSING_MAX_WAIT_SEC}s -- aborting rather than hanging."
+            )
+        time.sleep(2)
+        gfile = client.files.get(name=gfile.name)
+    return gfile
+
+
+def _transcribe_chunk(client, gfile, prompt, diar_header, prior_names, label):
+    """One chunk, with a single retry when the output is provably degenerate.
+
+    Retrying at a higher temperature is deliberate: near-greedy decoding is the
+    classic condition for a repetition loop, and the observed failure was exactly
+    that -- one token repeated 29,654 times until the output budget was gone."""
+    attempts = [
+        {"temperature": 0.1, "note": ""},
+        {"temperature": 0.4, "note": "\n\nIMPORTANT: never repeat the same phrase or "
+                                     "sentence consecutively. Each moment of the audio "
+                                     "appears exactly once."},
+    ]
+    last_text, last_report = "", {}
+    for i, cfg in enumerate(attempts):
+        full_prompt = prompt + diar_header + chunking.names_hint(prior_names) + cfg["note"]
+        resp = with_retries(f"{label} pass2", lambda: client.models.generate_content(
+            model='gemini-3.1-pro-preview',
+            contents=[full_prompt, gfile],
+            config=types.GenerateContentConfig(
+                response_mime_type="text/plain",
+                temperature=cfg["temperature"],
+                # Kept: removing thinking_config reproduces MAX_TOKENS truncation
+                # (verified 2026-08-31, reconfirmed 2026-09-02).
+                thinking_config=types.ThinkingConfig(thinking_level="LOW"),
+            ),
+        ))
+        log_token_usage(f"{label} pass2", resp)
+        text = (resp.text or "").strip()
+        finish = str(getattr(resp.candidates[0], "finish_reason", "")) if resp.candidates else ""
+
+        degenerate = transcript_checks.detect_intra_line_degeneration(text)
+        truncated = "MAX_TOKENS" in finish.upper()
+        u = getattr(resp, "usage_metadata", None)
+        last_text, last_report = text, {
+            "attempt": i + 1, "finish_reason": finish,
+            "max_intra_line_run": degenerate.get("max_run"),
+            "retried": i > 0,
+            "usage": {
+                "prompt_tokens": getattr(u, "prompt_token_count", None),
+                "cached_tokens": getattr(u, "cached_content_token_count", None),
+                "output_tokens": getattr(u, "candidates_token_count", None),
+                "total_tokens": getattr(u, "total_token_count", None),
+            } if u is not None else None,
+        }
+        if not degenerate.get("detected") and not truncated:
+            return text, last_report
+        print(f"[WARNING] {label}: degenerate={degenerate.get('detected')} "
+              f"(run={degenerate.get('max_run')}), truncated={truncated}"
+              + (" -- retrying once" if i == 0 else " -- keeping best effort"))
+    return last_text, last_report
+
+
+def run_chunked_transcript(client, local_audio_path, stem, diar, duration_sec,
+                           prompt, diar_header, fallback_file=None):
+    """Transcribe a recording as independent windows and stitch them.
+
+    Chunking is what CONTAINS the degenerate-loop failure: a loop can only ruin
+    one window instead of the whole transcript, and one window is cheap to detect
+    and retry. Boundaries fall in the silence between diarization turns, so no
+    utterance is split and no overlap-deduplication is needed."""
+    try:
+        plan = chunking.plan_chunks(diar, duration_sec)
+    except Exception as plan_err:
+        print(f"[WARNING] Chunk planning failed ({plan_err}) -- single-pass transcript.")
+        plan = []
+
+    # Probe before committing to the chunked path. A recording we cannot slice
+    # (unknown duration, non-PCM container, corrupt header) must still produce a
+    # transcript from the already-uploaded whole file, exactly as before chunking
+    # existed -- the same graceful-degradation contract used for diarization.
+    sliceable = False
+    if len(plan) > 1:
+        try:
+            with wave.open(local_audio_path, "rb"):
+                sliceable = True
+        except Exception as probe_err:
+            print(f"[WARNING] Audio is not sliceable ({probe_err}) -- single-pass transcript.")
+
+    if not sliceable:
+        if fallback_file is None:
+            raise RuntimeError("cannot chunk audio and no whole-file upload available")
+        text, rep = _transcribe_chunk(client, fallback_file, prompt, diar_header, [], "single pass")
+        rep.update({"index": 0, "chunked": False})
+        return text, [rep]
+
+    print(f"[Step 3b] Transcribing in {len(plan)} chunk(s).")
+
+    parts, reports, names = [], [], []
+    for idx, (start, end) in enumerate(plan):
+        label = f"chunk {idx + 1}/{len(plan)}"
+        cpath = chunking.chunk_paths("/tmp", stem, idx)
+        gfile = None
+        try:
+            chunking.slice_wav(local_audio_path, start, end, cpath)
+            gfile = _upload_and_wait(client, cpath, label)
+            text, rep = _transcribe_chunk(client, gfile, prompt, diar_header, names, label)
+            parts.append((start, text))
+            rep.update({"index": idx, "start_sec": round(start, 1), "end_sec": round(end, 1)})
+            reports.append(rep)
+            for n in chunking.established_names(text):
+                if n not in names:
+                    names.append(n)
+        finally:
+            # Per-chunk cleanup, so a long meeting cannot fill /tmp (which is
+            # instance memory on Cloud Run) or leak uploaded files on failure.
+            try:
+                if gfile:
+                    client.files.delete(name=gfile.name)
+            except Exception:
+                pass
+            try:
+                if os.path.exists(cpath):
+                    os.remove(cpath)
+            except Exception:
+                pass
+    return chunking.stitch(parts), reports
 
 
 @functions_framework.cloud_event
@@ -219,6 +489,10 @@ def tamlelan_handler(cloud_event):
     diar = None
     summary_response = None
     transcript_response = None
+    chunk_reports = []
+    transcript_warnings = []
+    transcript_report = {}
+    transcript_usage = None
     flash_res = None
     diagram_needed = False
     pipeline_error = None
@@ -232,10 +506,17 @@ def tamlelan_handler(cloud_event):
     # computes crc32c on upload, so this check costs nothing extra and needs no
     # download. Uses the same atomic if_generation_match=0 pattern as the lock
     # above, so it's race-safe under concurrent invocations too.
-    blob.reload()
-    content_key = blob.crc32c or blob.md5_hash
+    content_key = None
 
     try:
+        # Inside the try deliberately: this is a live GCS call and it used to sit
+        # OUTSIDE, so a transient failure here escaped with no finally block --
+        # no failed/ preservation, no metrics record, and critically no
+        # "[CRITICAL ERROR] Pipeline failed" line, which is the only thing the
+        # Cloud Monitoring alert matches on. The meeting vanished silently.
+        blob.reload()
+        content_key = blob.crc32c or blob.md5_hash
+
         if content_key:
             dup_marker_blob = bucket.blob(f"content_hashes/{content_key}.json")
             if dup_marker_blob.exists():
@@ -260,7 +541,10 @@ def tamlelan_handler(cloud_event):
             print(f"[Step 1b] Diarization companion loaded: {diar.get('speaker_count')} speakers, {diar.get('channel_mode')}.")
 
         api_key = os.environ.get("GEMINI_API_KEY")
-        client = genai.Client(api_key=api_key)
+        client = genai.Client(
+            api_key=api_key,
+            http_options=types.HttpOptions(timeout=GEMINI_HTTP_TIMEOUT_MS),
+        )
         
         gemini_file = with_retries("file upload", lambda: client.files.upload(file=local_audio_path))
         print("[Step 2] Uploaded to Gemini. Waiting for processing...")
@@ -285,23 +569,16 @@ def tamlelan_handler(cloud_event):
         # the audio, not left as fresh per-pass text. Falls back to the uncached path
         # on any failure (e.g. audio too short to meet the cache's minimum token
         # count) -- this must never be able to break the pipeline.
-        cache_contents = [gemini_file]
-        if diar_block:
-            cache_contents.append(diar_block)
-
+        # SUPERSEDED BY CHUNKING (2026-09-03). The cache existed because the same
+        # full audio was sent twice. Pass 2 is now chunked and reads its own
+        # per-chunk files, so the cache would serve exactly ONE read -- and a
+        # single-use cache costs more than not caching at all: you pay the full
+        # input rate to WRITE it ($2.00/M), plus hourly storage ($4.50/M/hr), and
+        # still pay to read it. Measured per meeting: $0.315 cached-once vs $0.214
+        # uncached. Pass 1 therefore uses the inline path, which already existed as
+        # the cache-failure fallback and is covered by
+        # tests/test_main_cleanup.py::TestCacheCreationFallback.
         cache = None
-        try:
-            cache = client.caches.create(
-                model='gemini-3.1-pro-preview',
-                config=types.CreateCachedContentConfig(
-                    contents=cache_contents,
-                    ttl="600s",
-                )
-            )
-            print(f"[Step 2b] Audio cached ({cache.name}) for reuse across both passes.")
-        except Exception as cache_err:
-            print(f"[WARNING] Context cache creation failed, falling back to uncached calls: {cache_err}")
-            cache = None
 
         # ==========================================
         # PASS 1: THE STRUCTURED SUMMARY (JSON)
@@ -505,33 +782,44 @@ def tamlelan_handler(cloud_event):
         text -- no preamble, no headings, no commentary.
         """
         
-        transcript_response = with_retries("Pass 2 (transcript)", lambda: client.models.generate_content(
-            model='gemini-3.1-pro-preview',
-            contents=[transcript_prompt] if cache else [transcript_prompt + diar_block, gemini_file],
-            config=types.GenerateContentConfig(
-                response_mime_type="text/plain",
-                temperature=0.1,
-                cached_content=cache.name if cache else None,
-                # Default thinking was observed burning ~63K tokens (42% of the
-                # total budget) on this pass, leaving too little for the actual
-                # transcript and truncating real meetings mid-way
-                # (finish_reason=MAX_TOKENS). thinking_level="LOW" completes the
-                # full transcript using fewer total tokens. Verified 2026-08-31
-                # against a real 54-min/8-speaker meeting recording, and
-                # reconfirmed 2026-09-02: removing thinking_config entirely
-                # reproduces the SAME MAX_TOKENS truncation, not a fix -- keep
-                # this setting. (A separate, still-open transcript-duplication
-                # defect exists independent of this setting; see ASR migration
-                # plan.)
-                thinking_config=types.ThinkingConfig(thinking_level="LOW")
-            )
-        ))
-        log_token_usage("Pass 2 (transcript)", transcript_response)
-
-        full_transcript_text = transcript_response.text.strip()
+        # Pass 2 is chunked (2026-09-03). Two measured failures drove this:
+        #  * With the diarization turn list in the prompt, the model emitted one
+        #    line per segment and copied its timestamp and label -- echo 1.00,
+        #    41% duplicated content, finish_reason=STOP. Complete-looking, fake.
+        #  * Without it, the model transcribes for real and names every speaker
+        #    correctly, but entered a degenerate loop at 18:05 repeating one token
+        #    29,654 times until the 65,536 output cap was gone (MAX_TOKENS, 40%
+        #    coverage).
+        # So: send the roster header WITHOUT the turn list, and chunk so a loop can
+        # only ruin one window -- which _transcribe_chunk detects and retries.
+        diar_header = format_diarization_for_prompt(diar, include_turns=False)
+        full_transcript_text, chunk_reports = run_chunked_transcript(
+            client, local_audio_path, os.path.basename(file_name), diar,
+            duration_sec, transcript_prompt, diar_header, fallback_file=gemini_file,
+        )
         if not full_transcript_text:
             full_transcript_text = "לא זוהה מלל."
         print(f"[Step 4b] Transcript generation complete.")
+
+        # Deterministic, zero-cost quality gate on the stitched transcript. Flags
+        # only -- the full text is always delivered unchanged. Before this, the
+        # transcript was checked for exactly one property (non-empty), which is why
+        # a 41%-duplicated transcript shipped to Drive looking like a success.
+        transcript_warnings, transcript_report = transcript_checks.verify_transcript(
+            full_transcript_text, diar=diar, duration_sec=duration_sec,
+        )
+        transcript_report["chunks"] = chunk_reports
+        transcript_usage = _sum_chunk_usage(chunk_reports)
+        if transcript_warnings:
+            # Log the English check names, never the Hebrew banner text: stdout is
+            # not guaranteed to be UTF-8 (a cp1252 console raised UnicodeEncodeError
+            # here and killed the whole run), and Cloud Logging is easier to filter
+            # and alert on with stable ASCII keys.
+            fired = [name for name, res in transcript_report.items()
+                     if isinstance(res, dict) and res.get("detected")]
+            print(f"[WARNING] Transcript quality checks flagged "
+                  f"{len(transcript_warnings)} issue(s) -- delivering with a banner. "
+                  f"Checks fired: {', '.join(fired) or 'finish_reason'}")
 
         # ==========================================
         # PASS 3 (LOCAL, NO API CALL): GROUNDING VERIFICATION
@@ -664,7 +952,11 @@ def tamlelan_handler(cloud_event):
         md_summary += "\n</div>"
 
         # Build Transcript Markdown using the result from Pass 2
-        md_transcript = f"<div dir='rtl'>\n# תמלול מלא\n\n{full_transcript_text}\n</div>"
+        # The banner is empty when every check passed, so a clean meeting is
+        # delivered exactly as before. The transcript itself is never modified.
+        transcript_banner = transcript_checks.warning_banner(transcript_warnings)
+        md_transcript = (f"<div dir='rtl'>\n# תמלול מלא\n\n"
+                         f"{transcript_banner}{full_transcript_text}\n</div>")
 
         # ==========================================
         # SEND TO GOOGLE DRIVE
@@ -674,10 +966,45 @@ def tamlelan_handler(cloud_event):
         webhook_secret = os.environ.get("WEBHOOK_SECRET")
 
         def send_to_drive(filename, content):
+            """Deliver one file to Drive via the Apps Script webhook.
+
+            The webhook answers HTTP 200 with {"status":"error"} for a bad secret
+            or a disallowed folder -- it does NOT use an error status code. The
+            previous version parsed that body and threw it away, so a rejected
+            write looked identical to a successful one: the pipeline reported
+            success, no alert fired, and the `finally` block then DELETED the
+            source recording. That is a silent, permanent data-loss path, and the
+            status check below is what closes it.
+
+            Also bounded and retried: urlopen had no timeout, so a hung Apps
+            Script blocked until Cloud Run killed the request -- and this is the
+            one component with a confirmed real production failure (HTTP 404 on
+            2026-08-12), yet it was the only external call with no retry.
+            """
             payload = json.dumps({"filename": filename, "content": content, "folder_id": folder_id, "secret": webhook_secret}).encode('utf-8')
-            req = urllib.request.Request(webhook_url, data=payload, headers={'Content-Type': 'application/json'})
-            with urllib.request.urlopen(req) as res:
-                return json.loads(res.read().decode())
+
+            def _post():
+                req = urllib.request.Request(webhook_url, data=payload, headers={'Content-Type': 'application/json'})
+                with urllib.request.urlopen(req, timeout=DRIVE_WEBHOOK_TIMEOUT_SEC) as res:
+                    body = res.read().decode()
+                # Fail on a KNOWN-BAD status, not on the absence of a known-good one.
+                # The deployed Apps Script is not version-controlled with this repo,
+                # so requiring an exact "success" string would risk failing every
+                # delivery if its response shape ever differs. The documented failure
+                # modes all return {"status":"error", "message": ...}, and that is
+                # precisely the case that used to be swallowed.
+                try:
+                    parsed = json.loads(body)
+                except json.JSONDecodeError:
+                    print(f"[WARNING] Drive webhook returned non-JSON for {filename}: "
+                          f"{body[:200]!r} -- treating as delivered.")
+                    return {"status": "unknown", "raw": body[:200]}
+                if str(parsed.get("status", "")).lower() == "error":
+                    raise RuntimeError(
+                        f"Drive webhook rejected {filename}: {parsed.get('message') or parsed}")
+                return parsed
+
+            return with_retries(f"Drive upload ({filename})", _post)
 
         base_name = time.strftime('%Y%m%d_%H%M%S')
         print("[Step 5a] Sending MD Summary to Google Drive...")
@@ -690,41 +1017,47 @@ def tamlelan_handler(cloud_event):
         # DIAGRAM GENERATION
         # ==========================================
         if res_data.get('diagram_needed'):
-            print("[Step 6] Generating Diagram with Flash...")
-            flash_prompt = f"""
-            Based on this Hebrew meeting summary, generate a valid, dark-themed HTML file containing a Mermaid.js flowchart (Flowchart TD) mapping the technical architecture discussed. Output ONLY raw HTML.
-            
-            Template:
-            <!DOCTYPE html>
-            <html dir="rtl">
-            <head>
-                <meta charset="UTF-8">
-                <script type="module">
-                    import mermaid from 'https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.esm.min.mjs';
-                    mermaid.initialize({{ startOnLoad: true, theme: 'dark' }});
-                </script>
-                <style>body {{ background-color: #121212; color: white; display: flex; justify-content: center; align-items: center; height: 100vh; margin: 0; font-family: Arial, sans-serif; }}</style>
-            </head>
-            <body>
-                <div class="mermaid">
-                %% MERMAID CODE HERE %%
-                </div>
-            </body>
-            </html>
-            
-            SUMMARY: {md_summary}
+            # Isolated: the diagram is a nice-to-have generated AFTER both expensive
+            # Gemini passes and both Drive deliveries have already succeeded. It used
+            # to share the main try, so one flash-lite hiccup failed the entire run,
+            # sent the audio to failed/, and wrote no content-hash marker -- meaning
+            # a re-upload paid for everything again and duplicated the Drive files.
+            try:
+                print("[Step 6] Generating Diagram with Flash...")
+                # The model is asked for the Mermaid GRAPH BODY ONLY, never for HTML.
+                # It previously authored the whole page ("Output ONLY raw HTML") from a
+                # summary derived from untrusted meeting speech, and the result was
+                # written to Drive as .html after nothing but two ``` strips -- a
+                # second-order injection path straight into a file the user opens in a
+                # browser. The page is now built locally from a fixed template.
+                flash_prompt = f"""
+            Read the Hebrew meeting summary below and produce a Mermaid.js flowchart
+            body describing the technical architecture discussed.
+
+            Output ONLY Mermaid graph source, starting with "flowchart TD".
+            Do NOT output HTML, <script>, <style>, markdown fences, or commentary.
+
+            SUMMARY:
+            {md_summary}
             """
-            
-            flash_res = client.models.generate_content(
-                model='gemini-3.1-flash-lite',
-                contents=flash_prompt,
-                config=types.GenerateContentConfig(temperature=0.1)
-            )
-            log_token_usage("Diagram (flash-lite)", flash_res)
-            html_content = flash_res.text.replace("```html", "").replace("```", "").strip()
-            
-            print("[Step 7] Sending HTML Diagram to Drive...")
-            send_to_drive(f"Diagram_{base_name}.html", html_content)
+                flash_res = client.models.generate_content(
+                    model='gemini-3.1-flash-lite',
+                    contents=flash_prompt,
+                    config=types.GenerateContentConfig(
+                        temperature=0.1,
+                        response_mime_type="text/plain",
+                    )
+                )
+                log_token_usage("Diagram (flash-lite)", flash_res)
+                mermaid_body = sanitize_mermaid(flash_res.text)
+                if mermaid_body:
+                    print("[Step 7] Sending HTML Diagram to Drive...")
+                    send_to_drive(f"Diagram_{base_name}.html",
+                                  render_diagram_html(mermaid_body))
+                else:
+                    print("[WARNING] Diagram output failed validation -- skipping diagram.")
+            except Exception as diagram_err:
+                print(f"[WARNING] Diagram generation failed, continuing: {diagram_err}")
 
         succeeded = True
 
@@ -735,16 +1068,39 @@ def tamlelan_handler(cloud_event):
 
     finally:
         print("[Step 8] Cleaning up...")
+        preserved_to_failed = False
         try:
             if blob.exists():
                 if succeeded:
                     blob.delete()
                 else:
                     print(f"[WARNING] Processing failed -- preserving source audio at failed/{file_name} instead of deleting it.")
-                    bucket.blob(f"failed/{file_name}").upload_from_string(blob.download_as_bytes())
+                    # copy_blob is server-side: no download, no re-upload, and no
+                    # second 169 MB allocation on the failure path, which is the
+                    # most memory-constrained path in the whole pipeline.
+                    bucket.copy_blob(blob, bucket, f"failed/{file_name}")
                     blob.delete()
+                    preserved_to_failed = True
         except Exception as cleanup_err:
             print(f"[WARNING] Cleanup could not preserve/delete source blob: {cleanup_err}")
+
+        # Release the Eventarc lock unless the audio was moved to failed/.
+        #
+        # The lock is written before processing and was never deleted anywhere, so
+        # every meeting left one behind forever. Worse, Eventarc redelivery reuses
+        # the same event id, so a crashed run's retry hit the lock, returned 200
+        # "Duplicate Event Aborted" and ACKED the message -- the only automatic
+        # retry the system has was defeated by the mechanism meant to make it safe.
+        #
+        # It is NOT released when the audio was preserved under failed/: the source
+        # is gone from the inbox, so a redelivery could only fail again. In that
+        # case the lock correctly stops a pointless retry loop, and failed/ plus the
+        # [CRITICAL ERROR] alert are the recovery path.
+        try:
+            if not preserved_to_failed:
+                lock_blob.delete()
+        except Exception as lock_err:
+            print(f"[WARNING] Could not release lock {event_id}: {lock_err}")
         try:
             companion_name = companion_name_for(file_name)
             if companion_name:
@@ -796,7 +1152,11 @@ def tamlelan_handler(cloud_event):
                 cache_write_tokens = _safe_num(getattr(getattr(cache, "usage_metadata", None), "total_token_count", None))
 
             metrics_record = {
-                "schema_version": 1,
+                # v2 (2026-09-03): explicit context caching removed (cache_used is
+                # now always False), pass2_transcript usage is summed across chunks
+                # rather than one call, and transcript_quality was added so the
+                # duplication defect becomes a measurable rate instead of an anecdote.
+                "schema_version": 2,
                 "event_id": event_id,
                 "file_stem": os.path.basename(file_name)[:-4] if file_name.endswith(".wav") else os.path.basename(file_name),
                 "started_at": started_at,
@@ -810,9 +1170,18 @@ def tamlelan_handler(cloud_event):
                 "cache_used": cache is not None,
                 "cache_write_tokens": cache_write_tokens,
                 "diagram_generated": diagram_needed,
+                "transcript_quality": {
+                    "warning_count": len(transcript_warnings),
+                    "checks_fired": [n for n, r in transcript_report.items()
+                                     if isinstance(r, dict) and r.get("detected")],
+                    "chunk_count": len(chunk_reports),
+                    "chunks_retried": sum(1 for r in chunk_reports if r.get("retried")),
+                    "max_intra_line_run": max(
+                        [r.get("max_intra_line_run") or 0 for r in chunk_reports] or [0]),
+                },
                 "usage": {
                     "pass1_summary": _usage_dict(summary_response),
-                    "pass2_transcript": _usage_dict(transcript_response),
+                    "pass2_transcript": transcript_usage,
                     "diagram_generation": _usage_dict(flash_res),
                 },
             }
