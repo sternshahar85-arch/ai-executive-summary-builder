@@ -189,6 +189,38 @@ class TestTimestampsAndCoverage(unittest.TestCase):
         self.assertFalse(tc.check_coverage(clean_transcript(), None)["detected"])
 
 
+class TestSpeakerLabelStability(unittest.TestCase):
+    """Calibrated against the 2026-09-03 validation runs, which passed every other
+    check: the 8-voice recording produced 19 distinct labels, the 5-voice one 7."""
+
+    def _diar(self, n):
+        return {"schema_version": 1, "channel_mode": "stereo_operator_left",
+                "speaker_count": n, "segments": [[0, 1, "ROOM_00"]]}
+
+    def test_label_count_within_tolerance_is_not_flagged(self):
+        t = "\n".join(line(i * 10, f"דובר {i % 5 + 1}", "טקסט") for i in range(40))
+        self.assertFalse(tc.check_speaker_label_stability(t, self._diar(5))["detected"])
+
+    def test_more_labels_than_voices_is_flagged(self):
+        t = "\n".join(line(i * 10, f"אדם{i}", "טקסט") for i in range(19))
+        r = tc.check_speaker_label_stability(t, self._diar(8))
+        self.assertTrue(r["detected"])
+        self.assertEqual(r["distinct_labels"], 19)
+        self.assertEqual(r["expected_voices"], 8)
+
+    def test_named_and_generic_are_counted_separately(self):
+        """'named 3 people' and 'gave up on 3 voices' mean different things."""
+        t = line(0, "ורד", "א") + "\n" + line(10, "דובר 1", "ב") + "\n" + line(20, "שחר", "ג")
+        r = tc.check_speaker_label_stability(t, self._diar(5))
+        self.assertEqual(r["named"], 2)
+        self.assertEqual(r["generic"], 1)
+
+    def test_no_companion_degrades_gracefully(self):
+        r = tc.check_speaker_label_stability(clean_transcript(), None)
+        self.assertFalse(r["detected"])
+        self.assertIn("reason", r)
+
+
 class TestVerifyTranscript(unittest.TestCase):
     def test_clean_transcript_produces_no_warnings(self):
         w, _ = tc.verify_transcript(clean_transcript(60, step=10),

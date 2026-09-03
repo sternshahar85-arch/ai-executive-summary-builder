@@ -51,6 +51,11 @@ ECHO_LIMIT = 0.5
 # duration is truncated, whatever finish_reason says.
 COVERAGE_MIN = 0.9
 
+# Labels the model uses when it could not establish a real name. Kept here (rather
+# than only in chunking) so the stability check can separate "named N people" from
+# "gave up on N voices" -- those mean different things about output quality.
+GENERIC_LABEL = re.compile(r"^(דובר|דוברת)\s*\d+$|^(ROOM|REMOTE|OPERATOR|SPEAKER)_?\d*$", re.I)
+
 
 def parse_lines(transcript):
     """[(index, seconds, speaker|None, text)] for every parseable line."""
@@ -58,14 +63,19 @@ def parse_lines(transcript):
     for i, raw in enumerate(transcript.splitlines()):
         if not raw.strip():
             continue
+        # Silence FIRST. `0:00 - 0:26: [שקט]` also satisfies the permissive
+        # speaker pattern, which captured "- 0" as the speaker and "26: [שקט]" as
+        # the text -- and those bogus labels were then carried into later chunks
+        # as though they were resolved names. Confirmed in both 2026-09-03
+        # validation transcripts.
+        s = SILENCE_LINE.match(raw)
+        if s:
+            out.append((i, int(s.group(1)) * 60 + int(s.group(2)), None, ""))
+            continue
         m = SPEAKER_LINE.match(raw)
         if m:
             speaker = (m.group("b") or m.group("p") or "").strip()
             out.append((i, int(m.group(1)) * 60 + int(m.group(2)), speaker, m.group("text")))
-            continue
-        s = SILENCE_LINE.match(raw)
-        if s:
-            out.append((i, int(s.group(1)) * 60 + int(s.group(2)), None, ""))
     return out
 
 
@@ -149,6 +159,35 @@ def detect_diarization_echo(transcript, diar, limit=ECHO_LIMIT):
             "line_count": len(parsed), "segment_count": len(segs)}
 
 
+def check_speaker_label_stability(transcript, diar=None, tolerance=1):
+    """Flag when the transcript invents more speakers than the audio contains.
+
+    Local clustering already knows how many distinct voices are present, so a
+    transcript carrying many more labels than that is mis-attributing speech --
+    either splitting one person across several labels or naming people who never
+    spoke. Measured on the 2026-09-03 validation runs, which passed every other
+    check: the 8-voice recording produced 19 distinct labels (10 names + 9
+    generic), and the 5-voice one named only 3 of 5 people.
+
+    Uses the same speaker_count + 1 tolerance as the Pass-1 attendee cross-check.
+    """
+    if not diar or not diar.get("speaker_count"):
+        return {"detected": False, "reason": "no diarization companion"}
+    labels = {spk for (_i, _s, spk, _t) in parse_lines(transcript) if spk}
+    if not labels:
+        return {"detected": False, "reason": "no speaker labels"}
+    generic = {l for l in labels if GENERIC_LABEL.match(l)}
+    named = labels - generic
+    expected = int(diar["speaker_count"])
+    return {
+        "detected": len(labels) > expected + tolerance,
+        "distinct_labels": len(labels),
+        "named": len(named),
+        "generic": len(generic),
+        "expected_voices": expected,
+    }
+
+
 def check_timestamps_monotonic(transcript):
     """Timestamps must not run backwards. A repeated block replays an earlier
     time, so this catches duplication independently of content matching."""
@@ -195,6 +234,8 @@ def verify_transcript(transcript, diar=None, duration_sec=None, finish_reason=No
              "חותמות הזמן אינן עולות באופן רציף -- ייתכן שחלק מהתמלול משוכפל."),
             ("coverage", check_coverage(transcript, duration_sec),
              "התמלול אינו מכסה את כל משך ההקלטה."),
+            ("speaker_label_stability", check_speaker_label_stability(transcript, diar),
+             "התמלול משתמש ביותר תוויות דובר ממספר הדוברים שזוהו בהקלטה -- ייתכן שיוחסו דברים לדובר שגוי."),
         )
         for name, result, message in checks:
             report[name] = result
