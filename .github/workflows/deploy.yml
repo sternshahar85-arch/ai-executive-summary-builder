@@ -95,7 +95,7 @@ jobs:
             --format="value(spec.containers[0].env[].name)")
           echo "Present env vars: $PRESENT"
           for VAR in $REQUIRED_ENV_VARS; do
-            if ! echo "$PRESENT" | tr ',' '\n' | grep -qx "$VAR"; then
+            if ! echo "$PRESENT" | tr ';' '\n' | grep -qx "$VAR"; then
               echo "::error::Required env var '$VAR' is missing from the new revision. Traffic will NOT be migrated."
               exit 1
             fi
