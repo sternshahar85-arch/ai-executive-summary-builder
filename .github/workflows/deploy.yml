@@ -75,11 +75,17 @@ jobs:
       # deletes coverage. This happened for months: six of the nine FakeBlob
       # copies lacked the content_type kwarg, so ~40 of 49 runs never executed
       # the metrics path while printing a warning nobody read.
-      - name: Fail on swallowed-exception warnings
+      - name: Fail on test-fake API drift
         run: |
           set -euo pipefail
-          if grep -qE "unexpected keyword argument|Could not write metrics record" /tmp/main.log; then
+          # Match the SIGNATURE-MISMATCH shape only. An earlier version also
+          # matched "Could not write metrics record", which is emitted
+          # deliberately by test_metrics_write_failure_does_not_affect_pipeline_result
+          # simulating a GCS failure -- a guard that cannot tell an intentional
+          # simulation from real drift just trains people to ignore it.
+          if grep -qE "unexpected keyword argument|takes [0-9]+ positional arguments? but|missing [0-9]+ required positional" /tmp/main.log; then
             echo "::error::A test fake has diverged from the real API -- a code path is silently untested."
+            grep -nE "unexpected keyword argument|takes [0-9]+ positional arguments? but|missing [0-9]+ required positional" /tmp/main.log | head -5
             exit 1
           fi
 
