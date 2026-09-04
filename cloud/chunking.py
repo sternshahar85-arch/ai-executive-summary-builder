@@ -32,6 +32,11 @@ MIN_CHUNK_SEC = 120         # never emit a trailing sliver as its own API call
 # Labels the model produces when it could NOT establish a real name. These must
 # not be carried forward as "already established" -- they are placeholders.
 _GENERIC_LABEL = re.compile(r"^(דובר|דוברת)\s*\d+$|^(ROOM|REMOTE|OPERATOR|SPEAKER)_?\d*$", re.I)
+# A real name contains at least one letter and never opens with punctuation. Guards
+# against parse artefacts such as "- 0", produced when a `M:SS - M:SS: [שקט]`
+# silence line is read as a speaker line -- those were being carried forward into
+# later chunks as if they were names people had actually been called.
+_NOT_A_NAME = re.compile(r"^[\W\d_]+$|^[-–—]")
 _LINE = re.compile(r"^(\s*)(\d+):(\d{2})(\s*(?:-\s*\d+:\d{2})?\s*)(.*)$")
 
 
@@ -134,7 +139,8 @@ def established_names(text):
         if not m:
             continue
         label = (m.group(1) or m.group(2) or "").strip()
-        if label and not _GENERIC_LABEL.match(label) and label not in seen:
+        if (label and not _GENERIC_LABEL.match(label) and not _NOT_A_NAME.match(label)
+                and label not in seen):
             seen.add(label)
             names.append(label)
     return names
