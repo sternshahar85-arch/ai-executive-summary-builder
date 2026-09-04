@@ -1140,11 +1140,24 @@ def tamlelan_handler(cloud_event):
                 u = getattr(resp, "usage_metadata", None) if resp is not None else None
                 if u is None:
                     return None
+                prompt = _safe_num(getattr(u, "prompt_token_count", None))
+                output = _safe_num(getattr(u, "candidates_token_count", None))
+                total = _safe_num(getattr(u, "total_token_count", None))
+                # Recorded explicitly rather than left to be derived. Thinking bills
+                # at the OUTPUT rate but appears in neither prompt_token_count nor
+                # candidates_token_count, so it was invisible to every cost figure
+                # this project produced until a Cloud Billing cross-check on
+                # 2026-09-04 showed spend was 2x what the records implied.
+                thinking = None
+                if all(isinstance(x, (int, float)) for x in (prompt, output, total)):
+                    thinking = max(0, int(total) - int(prompt) - int(output))
+                reported = _safe_num(getattr(u, "thoughts_token_count", None))
                 return {
-                    "prompt_tokens": _safe_num(getattr(u, "prompt_token_count", None)),
+                    "prompt_tokens": prompt,
                     "cached_tokens": _safe_num(getattr(u, "cached_content_token_count", None)),
-                    "output_tokens": _safe_num(getattr(u, "candidates_token_count", None)),
-                    "total_tokens": _safe_num(getattr(u, "total_token_count", None)),
+                    "output_tokens": output,
+                    "thinking_tokens": reported if reported is not None else thinking,
+                    "total_tokens": total,
                 }
 
             cache_write_tokens = None

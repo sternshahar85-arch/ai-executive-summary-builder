@@ -222,7 +222,7 @@ Both archived recordings were reprocessed through the live pipeline on 2026-09-0
 | Duplicated fraction | 0.0 | 0.0 | 
 | Coverage | 0.999 | 0.999 |
 | Transient error recovered | 504 | 503 |
-| Cost | $0.470 | $0.585 |
+| Cost (incl. thinking tokens) | $0.671 | $0.842 |
 
 ---
 
@@ -240,8 +240,10 @@ Both archived recordings were reprocessed through the live pipeline on 2026-09-0
    OIDC identity token.
 4. **The Apps Script `catch` block returns `error.toString()`** to the caller, a minor
    information leak.
-5. **Cost figures come from Gemini's self-reported token counts**, which this project has
-   found unreliable on the input side. Cross-check against Cloud Billing grouped by SKU.
+5. **Running cost rose about 19% with chunking**, not fallen. Measured on the same
+   recording processed by both designs: $0.706 -> $0.842. Input volume is unchanged;
+   the increase is entirely thinking tokens, because six chunked calls each pay their
+   own reasoning overhead. Real cost is roughly $0.67-0.95 per meeting.
 6. **`gemini-3.1-pro-preview` is a preview model.** Its predecessor was shut down with
    weeks of notice, and preview behaviour can change silently.
 

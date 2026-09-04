@@ -221,7 +221,8 @@ class TestMetricsHappyPath(unittest.TestCase):
         self.assertIsNone(record["cache_write_tokens"])  # no cache is created any more
         self.assertFalse(record["diagram_generated"])
         self.assertEqual(record["usage"]["pass1_summary"], {
-            "prompt_tokens": 1000, "cached_tokens": 500, "output_tokens": 200, "total_tokens": 1200,
+            "prompt_tokens": 1000, "cached_tokens": 500, "output_tokens": 200,
+            "thinking_tokens": 0, "total_tokens": 1200,
         })
         self.assertEqual(record["usage"]["pass2_transcript"], {
             "prompt_tokens": 1000, "cached_tokens": 500, "output_tokens": 800, "total_tokens": 1800,
@@ -265,7 +266,8 @@ class TestMetricsDiagramGeneration(unittest.TestCase):
         self.assertIsNotNone(record)
         self.assertTrue(record["diagram_generated"])
         self.assertEqual(record["usage"]["diagram_generation"], {
-            "prompt_tokens": 300, "cached_tokens": None, "output_tokens": 150, "total_tokens": 450,
+            "prompt_tokens": 300, "cached_tokens": None, "output_tokens": 150,
+            "thinking_tokens": 0, "total_tokens": 450,
         })
 
     def test_diagram_usage_absent_when_no_diagram_generated(self):

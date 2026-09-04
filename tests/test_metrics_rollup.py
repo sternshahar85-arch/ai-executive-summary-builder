@@ -13,6 +13,7 @@ import unittest
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "metrics"))
 
 import rollup
+import config
 
 FIXTURE_PATH = os.path.join(os.path.dirname(__file__), "fixtures", "sample_meetings.ndjson")
 REFERENCE_NOW = datetime.datetime(2026, 8, 31, 12, 0, 0, tzinfo=datetime.timezone.utc)
@@ -63,6 +64,40 @@ class TestTrailingWindow(unittest.TestCase):
         self.assertEqual(len(window), 4)
 
 
+class TestThinkingTokens(unittest.TestCase):
+    """Thinking bills at the OUTPUT rate but is reported in neither
+    prompt_token_count nor candidates_token_count. Ignoring it understated every
+    cost this project produced by 43-106%, confirmed against real Cloud Billing
+    on 2026-09-04 (551,355 billed output tokens vs ~144,000 counted)."""
+
+    def test_derived_from_total_minus_prompt_and_output(self):
+        # Real figures from the 2026-09-03 Aug-30 production run, Pass 1.
+        u = {"prompt_tokens": 85361, "output_tokens": 2766, "total_tokens": 96120}
+        self.assertEqual(rollup.thinking_tokens(u), 96120 - 85361 - 2766)
+
+    def test_missing_total_returns_zero_not_a_guess(self):
+        """Older records lack total_tokens; they stay computable and simply
+        remain understated rather than being estimated."""
+        self.assertEqual(rollup.thinking_tokens({"prompt_tokens": 10, "output_tokens": 5}), 0)
+
+    def test_never_negative(self):
+        u = {"prompt_tokens": 100, "output_tokens": 50, "total_tokens": 100}
+        self.assertEqual(rollup.thinking_tokens(u), 0)
+
+    def test_non_dict_is_safe(self):
+        self.assertEqual(rollup.thinking_tokens(None), 0)
+
+    def test_cost_includes_thinking_at_the_output_rate(self):
+        base = {"prompt_tokens": 1000, "cached_tokens": 0, "output_tokens": 1000}
+        without = dict(base, total_tokens=2000)          # no thinking
+        with_th = dict(base, total_tokens=3000)          # 1000 thinking tokens
+        rec = lambda p: {"usage": {"pass1_summary": p, "pass2_transcript": p}}
+        delta = rollup.cost_for(rec(with_th)) - rollup.cost_for(rec(without))
+        # 1000 thinking tokens x 2 passes at the output rate
+        expected = 2 * 1000 * config.GEMINI_PRICING["output_per_million"] / 1_000_000
+        self.assertAlmostEqual(delta, expected, places=9)
+
+
 class TestCostFor(unittest.TestCase):
     def test_one_on_one_no_cache(self):
         records = {r["event_id"]: r for r in rollup.load_records(FIXTURE_PATH)}
@@ -71,9 +106,24 @@ class TestCostFor(unittest.TestCase):
         self.assertAlmostEqual(cost, 0.076, places=6)
 
     def test_small_group_with_cache(self):
+        """Expected value recomputed 2026-09-04: cache_write_per_million moved
+        from 0.375 to 2.00 (real billing shows cache writes bill at the standard
+        input rate, with storage as a separate token-hours SKU), and thinking
+        tokens are now billed at the output rate."""
         records = {r["event_id"]: r for r in rollup.load_records(FIXTURE_PATH)}
-        cost = rollup.cost_for(records["evt-2"])
-        self.assertAlmostEqual(cost, 0.085625, places=6)
+        r = records["evt-2"]
+        expected = 0.0
+        for k in ("pass1_summary", "pass2_transcript"):
+            p = r["usage"][k]
+            uncached = max(p["prompt_tokens"] - p["cached_tokens"], 0)
+            think = rollup.thinking_tokens(p)
+            expected += uncached * config.GEMINI_PRICING["input_standard_per_million"] / 1e6
+            expected += p["cached_tokens"] * config.GEMINI_PRICING["input_cached_per_million"] / 1e6
+            expected += (p["output_tokens"] + think) * config.GEMINI_PRICING["output_per_million"] / 1e6
+        expected += r["cache_write_tokens"] * config.GEMINI_PRICING["cache_write_per_million"] / 1e6
+        self.assertAlmostEqual(rollup.cost_for(r), expected, places=9)
+        self.assertGreater(rollup.cost_for(r), 0.085625,
+                           "must exceed the pre-correction figure, which ignored thinking")
 
     def test_missing_pass2_returns_none(self):
         records = {r["event_id"]: r for r in rollup.load_records(FIXTURE_PATH)}

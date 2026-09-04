@@ -65,6 +65,28 @@ def bucket_for(speaker_count):
     return "unknown"
 
 
+def thinking_tokens(pass_usage):
+    """Tokens the model spent reasoning, derived from what the record already has.
+
+    Gemini bills these at the OUTPUT rate, but reports them in neither
+    prompt_token_count nor candidates_token_count -- total_token_count is the
+    only place they surface. Measured across the three 2026-09-03 production
+    runs, thinking was 1.63x the visible output, so ignoring it understated
+    per-meeting cost by 43-106%.
+
+    Returns 0 when total_tokens is absent (older records) rather than guessing,
+    so historical rows stay computable and simply remain understated.
+    """
+    if not isinstance(pass_usage, dict):
+        return 0
+    total = pass_usage.get("total_tokens")
+    prompt = pass_usage.get("prompt_tokens")
+    output = pass_usage.get("output_tokens")
+    if not all(isinstance(v, (int, float)) for v in (total, prompt, output)):
+        return 0
+    return max(0, int(total) - int(prompt) - int(output))
+
+
 def cost_for(record):
     """Returns a float $ cost, or None if usage data is missing/incomplete --
     callers must exclude None from totals rather than treating it as $0."""
@@ -80,10 +102,17 @@ def cost_for(record):
         output = p.get("output_tokens")
         if prompt is None or output is None:
             return None
+        # Thinking tokens are billed at the OUTPUT rate but are reported in
+        # neither prompt_token_count nor candidates_token_count. Omitting them
+        # understated every cost this project has ever produced by 40-100%,
+        # confirmed 2026-09-04 against real Cloud Billing: the "text output"
+        # SKU showed 551,355 tokens against ~144,000 counted here. Derive them
+        # from total_token_count, which the record already stored all along.
+        thinking = thinking_tokens(p)
         uncached = max(prompt - cached, 0)
         total += uncached * GEMINI_PRICING["input_standard_per_million"] / 1_000_000
         total += cached * GEMINI_PRICING["input_cached_per_million"] / 1_000_000
-        total += output * GEMINI_PRICING["output_per_million"] / 1_000_000
+        total += (output + thinking) * GEMINI_PRICING["output_per_million"] / 1_000_000
 
     if record.get("cache_used") and isinstance(record.get("cache_write_tokens"), (int, float)):
         total += record["cache_write_tokens"] * GEMINI_PRICING["cache_write_per_million"] / 1_000_000
@@ -156,10 +185,10 @@ def render_table(records):
 
     lines.append("")
     lines.append(
-        "*$ figures are estimated from Gemini's self-reported token counts, which this "
-        "project found to be unreliable on the input side for this model under explicit "
-        "caching (see metrics/config.py) -- treat as directional, and periodically "
-        "cross-check against Cloud Billing -> Reports (Group by: SKU).*"
+        "*$ figures include thinking tokens (billed at the output rate, derived from "
+        "total_token_count -- see metrics/config.py). Verified against real Cloud "
+        "Billing on 2026-09-04. Records written before that date lack total_tokens for "
+        "some passes and remain understated.*"
     )
 
     return "\n".join(lines)

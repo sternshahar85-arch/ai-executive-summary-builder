@@ -12,7 +12,15 @@ GEMINI_PRICING = {
     # pricing can change without notice.
     "input_standard_per_million": 2.00,
     "input_cached_per_million": 0.20,
-    "cache_write_per_million": 0.375,
+    # Corrected 2026-09-04 against real billing SKUs. Was 0.375. There is no
+    # separate "cache write" SKU: writes appear inside the ordinary audio/text
+    # input counts and bill at the standard input rate. Storage is billed
+    # separately as "cached ... storage token hours" at $4.50/M/hour, which
+    # cost_for() does NOT model -- it was ~$0.04 per meeting at the 600s TTL,
+    # and explicit caching was removed from the pipeline when Pass 2 became
+    # chunked, so this constant now only affects historical records.
+    "cache_write_per_million": 2.00,
+    # Thinking tokens bill at this same rate -- see rollup.thinking_tokens().
     "output_per_million": 12.00,
 }
 
@@ -45,6 +53,21 @@ GEMINI_FLASH_LITE_PRICING = {
 # billing) -- only the input-side dollar estimate below is in question.
 # Treat cost_for()'s output as directional, not precise, and cross-check
 # periodically against Cloud Billing -> Reports (Group by: SKU).
+#
+# CORRECTION, 2026-09-04: the note above claims "the OUTPUT-token numbers are
+# unaffected by this ... and matched by real billing". That was wrong, and it
+# was the more expensive error of the two. cost_for() counted only
+# candidates_token_count and ignored THINKING tokens, which bill at the same
+# output rate. The first real Cloud Billing cross-check (the one this comment
+# had been recommending since August, never actually performed) showed the
+# "text output token count" SKU at 551,355 tokens against ~144,000 counted --
+# the missing ~407,000 were thinking. Per-meeting cost was understated by
+# 43-106%, and total spend for 2026-09-03 by 2.02x.
+#
+# Thinking tokens are now derived in rollup.thinking_tokens() from
+# total_token_count, which the durable records had been storing all along.
+# The input-side caveat above still stands, but it is worth under a cent per
+# meeting; the output side was the one that mattered.
 
 # Maps a minimum speaker_count to a bucket name. A record's bucket is the
 # highest threshold its speaker_count meets or exceeds. speaker_count of 0/1,
