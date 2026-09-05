@@ -23,13 +23,15 @@ measurements rather than on preference), approving plans after weighing their tr
 directing investigations into production defects, and continuously verifying real system
 output against real recordings rather than trusting a green test suite alone.
 
-One concrete example, carried through to its end. A production meeting surfaced a
-transcript-duplication defect. I did not accept the first plausible-sounding hypothesis; I
-directed a live A/B against the actual recording instead. What broke it open was testing the
-output's **structure** rather than its content: comparing each output row against the
-diarization segment at the same index showed **217 of 217 timestamps and labels matching at
-identical indices**. That is not transcription with errors in it. That is a template being
-copied, and no amount of reading the transcript would have revealed it.
+One concrete example, carried through to its end. A production meeting produced a transcript
+whose last third repeated the same block of dialogue three times. I tested the hypotheses
+rather than acting on them, and reversed my own first conclusion once the measurements
+disagreed with it. What broke the problem open was testing the output's **structure** rather
+than its content: comparing each output row against the diarization segment at the same
+index. On the archived recording used for that test, **217 of 217 timestamps and 217 of 217
+speaker labels matched at identical indices**. That is not transcription with errors in it.
+That is a template being copied, and no amount of reading the transcript would have revealed
+it.
 
 The fix was not the obvious one either. Pass 1 was then tested the same way and behaved in
 the **opposite** direction: the same speaker list that Pass 2 was copying is what keeps Pass
