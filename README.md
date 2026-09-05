@@ -13,6 +13,37 @@ unverified, it says so.
 
 ---
 
+## How This Was Built
+
+This system was built with Claude Code as an implementation partner. My role across the
+project: defining requirements, researching and deciding between architectural alternatives
+— including whether to keep an audio-native LLM pipeline or move to a dedicated
+speech-to-text service, which was evaluated against real recordings and rejected on the
+measurements rather than on preference — approving plans after weighing their tradeoffs,
+directing investigations into production defects, and continuously verifying real system
+output against real recordings rather than trusting a green test suite alone.
+
+One concrete example, carried through to its end. A production meeting surfaced a
+transcript-duplication defect. I did not accept the first plausible-sounding hypothesis; I
+directed a live A/B against the actual recording instead. What broke it open was testing the
+output's **structure** rather than its content: comparing each output row against the
+diarization segment at the same index showed **217 of 217 timestamps and labels matching at
+identical indices**. That is not transcription with errors in it — that is a template being
+copied, and no amount of reading the transcript would have revealed it.
+
+The fix was not the obvious one either. Pass 1 was then tested the same way and behaved in
+the **opposite** direction: the same speaker list that Pass 2 was copying is what keeps Pass
+1 factually anchored to the audio. The two passes needed opposite treatment — Pass 1 keeps
+the turn list, Pass 2 must never receive it (§3.2). A fix applied uniformly to both would
+have traded one defect for another.
+
+The deploy-safety workflow (`.github/workflows/deploy.yml`) exists for the same reason: a
+past deploy broke silently in production, and the fix was to replace a manual checklist with
+an automated gate that fails loudly instead of trusting that the checklist gets followed
+correctly every time (§5, §6).
+
+---
+
 ## 1. Current architecture
 
 ### 1.1 Local client (Windows)
@@ -251,14 +282,14 @@ Both archived recordings were reprocessed through the live pipeline on 2026-09-0
 
 ## 5. Testing
 
-**170 tests across 16 files**, in two isolated environments.
+**175 tests across 16 files**, in two isolated environments.
 
 | Suite | Environment | Tests |
 |---|---|---|
 | `test_main_*.py` | `.venv-cloud` (`cloud/requirements.txt`) | 62 |
 | `test_transcript_*.py` | `.venv-cloud` | 32 |
 | `test_chunking.py` | `.venv-cloud` | 25 |
-| `test_metrics_*.py` | `.venv-cloud` | 20 |
+| `test_metrics_*.py` | `.venv-cloud` | 25 |
 | `test_scribe_*.py` | system Python (`requirements-client.txt`) | 31 |
 
 The two environments are genuinely separate: the client suite needs `numpy`/`scipy`, which
