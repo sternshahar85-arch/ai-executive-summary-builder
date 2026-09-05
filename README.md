@@ -1,7 +1,7 @@
 # AI Executive Summary Builder
 
 **Document type:** architecture and current state
-**As of:** 2026-09-04, production revision `tamlelan-processor-00064-zuw`
+**As of:** 2026-09-04, production revision `tamlelan-processor-00067-foy`
 **Objective:** an autonomous, serverless, zero-subscription AI meeting agent. It records
 local audio, uploads it to a cloud bucket, triggers an LLM pipeline for structured data
 extraction and transcription, and writes a Hebrew summary and transcript to a personal
